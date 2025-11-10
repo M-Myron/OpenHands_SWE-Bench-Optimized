@@ -323,23 +323,40 @@ def prebuild_instance_image(
                 repo = runtime_image
                 tag = 'latest'
 
+            # Add additional tags before pushing
+            # Tag 1: base_image name (without hashing/encoding)
+            # Tag 2: lock_tag (to mirror the lock tag used in build)
+            client = runtime_builder.docker_client
+            image = client.images.get(runtime_image)
+            
+            # Normalize base image name for tagging (replace special chars)
+            base_image_tag = base_image.replace('/', '_').replace(':', '_')
+            additional_tags = [
+                f'{repo}:{base_image_tag}',
+                f'{repo}:{lock_tag}',
+            ]
+            
+            logger.info(f'[{instance_id}] Adding additional tags to image...')
+            for additional_tag in additional_tags:
+                try:
+                    image.tag(additional_tag)
+                    logger.info(f'[{instance_id}] Tagged image as: {additional_tag}')
+                except Exception as tag_error:
+                    logger.warning(
+                        f'[{instance_id}] Failed to add tag {additional_tag} (non-fatal): {tag_error}'
+                    )
+
             # Push the image with retry logic
             retry_delay = 10  # Initial delay in seconds
             push_succeeded = False
+            
+            # Collect all tags to push (source_tag + additional tags)
+            all_tags_to_push = [tag, base_image_tag, lock_tag]
 
             for attempt in range(1, max_push_retries + 1):
                 try:
                     client = runtime_builder.docker_client
                     client.images.get(runtime_image)
-
-                    # Push with progress - increase timeout for large images
-                    # Default timeout is often too short for 500MB-1GB images
-                    push_kwargs = {
-                        'repository': repo,
-                        'tag': tag,
-                        'stream': True,
-                        'decode': True,
-                    }
 
                     if attempt > 1:
                         logger.info(
@@ -347,27 +364,44 @@ def prebuild_instance_image(
                         )
                     else:
                         logger.info(
-                            f'[{instance_id}] Starting push (this may take several minutes for large images)...'
+                            f'[{instance_id}] Starting push for all tags (this may take several minutes for large images)...'
                         )
 
-                    for line in client.api.push(**push_kwargs):
-                        if 'error' in line:
-                            raise Exception(line['error'])
-                        if 'status' in line:
-                            status = line['status']
-                            progress = line.get('progress', '')
-                            # Log detailed progress for monitoring
-                            if 'Pushing' in status or 'Pushed' in status:
-                                logger.debug(f'[{instance_id}] {status} {progress}')
-                            elif status not in [
-                                'Preparing',
-                                'Waiting',
-                                'Layer already exists',
-                            ]:
-                                logger.info(f'[{instance_id}] {status}')
+                    # Push all tags
+                    for tag_to_push in all_tags_to_push:
+                        logger.info(f'[{instance_id}] Pushing tag: {repo}:{tag_to_push}')
+                        
+                        # Push with progress - increase timeout for large images
+                        # Default timeout is often too short for 500MB-1GB images
+                        push_kwargs = {
+                            'repository': repo,
+                            'tag': tag_to_push,
+                            'stream': True,
+                            'decode': True,
+                        }
+
+                        for line in client.api.push(**push_kwargs):
+                            if 'error' in line:
+                                raise Exception(line['error'])
+                            if 'status' in line:
+                                status = line['status']
+                                progress = line.get('progress', '')
+                                # Log detailed progress for monitoring
+                                if 'Pushing' in status or 'Pushed' in status:
+                                    logger.debug(f'[{instance_id}] {status} {progress}')
+                                elif status not in [
+                                    'Preparing',
+                                    'Waiting',
+                                    'Layer already exists',
+                                ]:
+                                    logger.info(f'[{instance_id}] {status}')
+                        
+                        logger.info(
+                            f'[{instance_id}] Successfully pushed tag: {repo}:{tag_to_push}'
+                        )
 
                     logger.info(
-                        f'[{instance_id}] Successfully pushed image: {runtime_image}'
+                        f'[{instance_id}] Successfully pushed all tags for image: {runtime_image}'
                     )
                     push_succeeded = True
 
