@@ -107,11 +107,11 @@ fi
 #   echo "ℹ️  NO_SKIP_EXISTING=true: Will rebuild existing images"
 # fi
 
-if [ "$ENABLE_BROWSER" = "true" ]; then
-  COMMAND="$COMMAND --enable-browser"
-  echo "⚠️  ENABLE_BROWSER=true: Building with browser support"
-  echo "    Make sure to set RUN_WITH_BROWSING=true when running evaluations!"
-fi
+# if [ "$ENABLE_BROWSER" = "true" ]; then
+#   COMMAND="$COMMAND --enable-browser"
+#   echo "⚠️  ENABLE_BROWSER=true: Building with browser support"
+#   echo "    Make sure to set RUN_WITH_BROWSING=true when running evaluations!"
+# fi
 
 if [ "$NO_CLEANUP" = "true" ]; then
   COMMAND="$COMMAND --no-cleanup"

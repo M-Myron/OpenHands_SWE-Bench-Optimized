@@ -25,8 +25,8 @@ import requests
 from datasets import load_dataset
 from tqdm import tqdm
 
+from evaluation.benchmarks.swe_bench import run_infer
 from evaluation.benchmarks.swe_bench.run_infer import (
-    DATASET_TYPE,
     get_instance_docker_image,
     set_dataset_type,
 )
@@ -328,14 +328,14 @@ def prebuild_instance_image(
             # Tag 2: lock_tag (to mirror the lock tag used in build)
             client = runtime_builder.docker_client
             image = client.images.get(runtime_image)
-            
+
             # Normalize base image name for tagging (replace special chars)
             base_image_tag = base_image.replace('/', '_').replace(':', '_')
             additional_tags = [
                 f'{repo}:{base_image_tag}',
                 f'{repo}:{lock_tag}',
             ]
-            
+
             logger.info(f'[{instance_id}] Adding additional tags to image...')
             for additional_tag in additional_tags:
                 try:
@@ -349,7 +349,7 @@ def prebuild_instance_image(
             # Push the image with retry logic
             retry_delay = 10  # Initial delay in seconds
             push_succeeded = False
-            
+
             # Collect all tags to push (source_tag + additional tags)
             all_tags_to_push = [tag, base_image_tag, lock_tag]
 
@@ -370,7 +370,7 @@ def prebuild_instance_image(
                     # Push all tags
                     for tag_to_push in all_tags_to_push:
                         logger.info(f'[{instance_id}] Pushing tag: {repo}:{tag_to_push}')
-                        
+
                         # Push with progress - increase timeout for large images
                         # Default timeout is often too short for 500MB-1GB images
                         push_kwargs = {
@@ -395,7 +395,7 @@ def prebuild_instance_image(
                                     'Layer already exists',
                                 ]:
                                     logger.info(f'[{instance_id}] {status}')
-                        
+
                         logger.info(
                             f'[{instance_id}] Successfully pushed tag: {repo}:{tag_to_push}'
                         )
@@ -568,8 +568,9 @@ def prebuild_all_images(
         instance_id = instance['instance_id']
 
         # Determine if we're using official SWE-Bench images
-        use_swebench_official_image = DATASET_TYPE != 'SWE-Gym'
+        use_swebench_official_image = run_infer.DATASET_TYPE != 'SWE-Gym'
 
+        print(f'Processing instance {instance_id}, SWE-bench official image: {use_swebench_official_image}, DATASET_TYPE={run_infer.DATASET_TYPE}')
         base_image = get_instance_docker_image(
             instance_id, swebench_official_image=use_swebench_official_image
         )

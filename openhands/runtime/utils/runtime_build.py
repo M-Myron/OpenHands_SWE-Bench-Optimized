@@ -223,7 +223,7 @@ def build_runtime_image_in_folder(
 
     # If not found locally, try to pull from remote registry
     logger.info(
-        f'Image [{hash_image_name}] not found locally, checking remote registry...'
+        f'Image [{hash_image_name}] for base [{base_image}] not found locally, checking remote registry...'
     )
     try:
         if runtime_builder.image_exists(hash_image_name, pull_from_repo=True):
@@ -233,7 +233,7 @@ def build_runtime_image_in_folder(
             return hash_image_name
         else:
             logger.info(
-                f'Image [{hash_image_name}] not found in remote registry, will build locally.'
+                f'Image [{hash_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
             )
     except Exception as e:
         error_str = str(e).lower()
