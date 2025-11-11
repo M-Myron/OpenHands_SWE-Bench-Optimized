@@ -266,29 +266,51 @@ def prebuild_instance_image(
         )
         source_tag = f'{lock_tag}_{get_hash_for_source_files()}'
         expected_runtime_image = f'{runtime_image_repo}:{source_tag}'
+        
+        # Prepare all tags for checking (same tags that will be pushed)
+        base_image_tag = base_image.replace('/', '_').replace(':', '_')
+        all_tags = [source_tag, base_image_tag, lock_tag]
 
         # Check if image already exists in remote registry (unless force_rebuild)
         if not force_rebuild and push_to_registry:
             logger.info(
-                f'[{instance_id}] Fast-checking remote registry for: {expected_runtime_image}'
+                f'[{instance_id}] Fast-checking remote registry for tags: {all_tags}'
             )
-            try:
-                remote_check = remote_image_exists(
-                    runtime_image_repo, source_tag, runtime_builder.docker_client
-                )
-            except Exception:
-                remote_check = None
+            
+            # Check all three tags - if any exists, the image is available
+            remote_check = None
+            found_tag = None
+            for tag_to_check in all_tags:
+                try:
+                    check_result = remote_image_exists(
+                        runtime_image_repo, tag_to_check, runtime_builder.docker_client
+                    )
+                    if check_result is True:
+                        remote_check = True
+                        found_tag = tag_to_check
+                        break
+                    elif check_result is False:
+                        # Definitively not found, continue checking other tags
+                        continue
+                    else:
+                        # Inconclusive result (None), keep checking other tags
+                        # but remember we had an inconclusive check
+                        if remote_check is None:
+                            remote_check = None
+                except Exception:
+                    # Error during check, continue to next tag
+                    continue
 
             if remote_check is True:
                 logger.info(
-                    f'[{instance_id}] ✅ Image already exists in remote registry, skipping build: {expected_runtime_image}'
+                    f'[{instance_id}] ✅ Image already exists in remote registry (found tag: {found_tag}), skipping build: {expected_runtime_image}'
                 )
                 return (instance_id, True, expected_runtime_image)
 
             # If remote check could not conclusively determine existence, fall back to previous method
             if remote_check is None:
                 logger.debug(
-                    f'[{instance_id}] Remote fast-check inconclusive, falling back to pull-based existence check'
+                    f'[{instance_id}] Remote fast-check inconclusive for all tags, falling back to pull-based existence check'
                 )
                 if runtime_builder.image_exists(
                     expected_runtime_image, pull_from_repo=True
