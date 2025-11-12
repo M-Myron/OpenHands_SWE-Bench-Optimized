@@ -231,6 +231,11 @@ def build_runtime_image_in_folder(
                 f'✅ Successfully pulled prebuilt image from registry: [{hash_image_name}]'
             )
             return hash_image_name
+        elif runtime_builder.image_exists(lock_image_name, pull_from_repo=True):
+            logger.info(
+                f'✅ Successfully pulled prebuilt lock image from registry: [{lock_image_name}]'
+            )
+            return lock_image_name
         else:
             logger.info(
                 f'Image [{hash_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
