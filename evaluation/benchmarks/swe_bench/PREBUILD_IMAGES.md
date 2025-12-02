@@ -177,7 +177,7 @@ Small troubleshooting tips:
 
 ```bash
 # Use custom registry
-export OH_RUNTIME_RUNTIME_IMAGE_REPO="docker.io/myusername/openhands-runtime"
+export OH_RUNTIME_RUNTIME_IMAGE_REPO="docker.io/mmr1115/openhands-runtime"
 ./evaluation/benchmarks/swe_bench/scripts/prebuild_images.sh \
     princeton-nlp/SWE-bench_Verified test 4
 
