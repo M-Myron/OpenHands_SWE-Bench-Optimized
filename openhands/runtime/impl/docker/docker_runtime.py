@@ -251,7 +251,10 @@ class DockerRuntime(ActionExecutionClient):
     @lru_cache(maxsize=1)
     def _init_docker_client() -> docker.DockerClient:
         try:
-            return docker.from_env()
+            # Increase timeout to 300 seconds for slow container startup
+            # This is especially important for large SWE-bench images
+            # Default 60s timeout is often insufficient for large images or slow systems
+            return docker.from_env(timeout=300)
         except Exception as ex:
             logger.error(
                 'Launch docker client failed. Please make sure you have installed docker and started docker desktop/daemon.',
