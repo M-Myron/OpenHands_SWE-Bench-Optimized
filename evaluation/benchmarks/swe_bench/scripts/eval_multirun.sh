@@ -87,13 +87,13 @@ for i in "${!RUN_DIRS[@]}"; do
 done
 echo ""
 
-# Ask for confirmation
-read -p "Proceed with evaluation? (y/n) " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Evaluation cancelled."
-    exit 0
-fi
+# # Ask for confirmation
+# read -p "Proceed with evaluation? (y/n) " -n 1 -r
+# echo ""
+# if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+#     echo "Evaluation cancelled."
+#     exit 0
+# fi
 
 # Evaluate each run
 TOTAL_RUNS=${#RUN_DIRS[@]}
@@ -125,16 +125,16 @@ for i in "${!RUN_DIRS[@]}"; do
         continue
     fi
     
-    # Check if already evaluated
-    if [ -f "$RUN_DIR/report.json" ]; then
-        read -p "Report already exists. Re-evaluate? (y/n) " -n 1 -r
-        echo ""
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "Skipping $(basename "$RUN_DIR")"
-            echo ""
-            continue
-        fi
-    fi
+    # # Check if already evaluated
+    # if [ -f "$RUN_DIR/report.json" ]; then
+    #     read -p "Report already exists. Re-evaluate? (y/n) " -n 1 -r
+    #     echo ""
+    #     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    #         echo "Skipping $(basename "$RUN_DIR")"
+    #         echo ""
+    #         continue
+    #     fi
+    # fi
     
     # Run evaluation
     START_TIME=$(date +%s)
@@ -171,55 +171,6 @@ if [ $FAILED_RUNS -gt 0 ]; then
     for dir in "${FAILED_DIRS[@]}"; do
         echo "  - $dir"
     done
-fi
-
-echo ""
-echo "=============================================================="
-echo "Generating aggregated results..."
-echo "=============================================================="
-
-# Prepare list of report files for aggregation
-REPORT_FILES=()
-for RUN_DIR in "${RUN_DIRS[@]}"; do
-    REPORT_FILE="$RUN_DIR/report.json"
-    if [ -f "$REPORT_FILE" ]; then
-        REPORT_FILES+=("$REPORT_FILE")
-    fi
-done
-
-if [ ${#REPORT_FILES[@]} -gt 0 ]; then
-    echo "Found ${#REPORT_FILES[@]} report files"
-    
-    # Get parent directory for aggregated results
-    if [ ${#RUN_DIRS[@]} -eq 1 ]; then
-        PARENT_DIR="$(dirname "${RUN_DIRS[0]}")"
-    else
-        # Find common parent directory
-        PARENT_DIR="$(dirname "${RUN_DIRS[0]}")"
-    fi
-    
-    # Create a space-separated list of report files
-    REPORT_FILES_STR="${REPORT_FILES[@]}"
-    
-    # Call Python script to aggregate results
-    if [ -f "$SCRIPT_DIR/eval/aggregate_multirun_results.py" ]; then
-        echo "Aggregating results from multiple runs..."
-        poetry run python "$SCRIPT_DIR/eval/aggregate_multirun_results.py" $REPORT_FILES_STR --output "$PARENT_DIR/multirun_aggregate.json"
-        
-        if [ $? -eq 0 ]; then
-            echo "✓ Aggregated results saved to: $PARENT_DIR/multirun_aggregate.json"
-        else
-            echo "✗ Failed to aggregate results"
-        fi
-    else
-        echo "Note: aggregate_multirun_results.py not found. Skipping aggregation."
-        echo "Report files are available at:"
-        for rf in "${REPORT_FILES[@]}"; do
-            echo "  - $rf"
-        done
-    fi
-else
-    echo "No report files found for aggregation"
 fi
 
 echo ""
