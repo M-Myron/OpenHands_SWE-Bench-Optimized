@@ -29,7 +29,7 @@ else
     export EVAL_DOCKER_IMAGE_PREFIX="us-central1-docker.pkg.dev/evaluation-092424/swe-bench-images"
 fi
 
-EVAL_LIMIT=3000
+EVAL_LIMIT=500
 MAX_ITER=100
 
 
@@ -51,6 +51,30 @@ EVAL_NOTE="$OPENHANDS_VERSION-no-hint-$EXP_NAME"
 
 function run_eval() {
   local eval_note=$1
+  
+  # Start periodic Docker cleanup in background (only for local docker runtime)
+  if [ "$RUNTIME" = "docker" ]; then
+    (
+      while true; do
+        sleep 1800  # Every 30 minutes
+        echo "### Running periodic Docker cleanup during evaluation... ###"
+        # Remove stopped containers
+        docker ps -q --filter "name=openhands-runtime-" --filter "status=exited" | xargs -r docker rm 2>/dev/null || true
+        # Remove SWE-bench evaluation images
+        docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
+        # Prune dangling images and build cache
+        docker image prune -f 2>/dev/null || true
+        docker builder prune -f --filter "until=30m" 2>/dev/null || true
+        # Show current usage
+        echo "Current Docker usage:"
+        docker system df
+        echo "Running containers: $(docker ps -q | wc -l)"
+        echo "Total images: $(docker images -q | wc -l)"
+      done
+    ) &
+    CLEANUP_PID=$!
+  fi
+  
   COMMAND="poetry run python evaluation/benchmarks/swe_bench/run_infer.py \
     --agent-cls CodeActAgent \
     --llm-config $MODEL \
@@ -67,6 +91,11 @@ function run_eval() {
 
   # Run the command
   eval $COMMAND
+  
+  # Kill the cleanup background process
+  if [ "$RUNTIME" = "docker" ]; then
+    kill $CLEANUP_PID 2>/dev/null || true
+  fi
 }
 
 for run_idx in $(seq 1 $N_RUNS); do
@@ -83,12 +112,25 @@ for run_idx in $(seq 1 $N_RUNS); do
         echo "### Cleaning up remote runtime... ###"
         ./evaluation/utils/scripts/cleanup_remote_runtime.sh
 
-        # # Also cleanup local docker containers if running locally
-        # if [ "$RUNTIME" = "docker" ]; then
-        #     echo "### Cleaning up local docker containers... ###"
-        #     docker ps -q --filter "name=openhands-runtime-" | xargs -r docker stop
-        #     docker ps -aq --filter "name=openhands-runtime-" | xargs -r docker rm
-        # fi
+        # Also cleanup local docker containers and images if running locally
+        if [ "$RUNTIME" = "docker" ]; then
+            echo "### Cleaning up local docker containers... ###"
+            docker ps -q --filter "name=openhands-runtime-" | xargs -r docker stop
+            docker ps -aq --filter "name=openhands-runtime-" | xargs -r docker rm
+            
+            echo "### Cleaning up SWE-bench related docker images... ###"
+            # Only remove images from the evaluation registry to avoid affecting other processes
+            # This targets the specific images pulled for this evaluation run
+            docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
+            
+            echo "### Pruning dangling images and build cache... ###"
+            # Prune dangling images and old build cache
+            docker image prune -f 2>/dev/null || true
+            docker builder prune -f --filter "until=1h" 2>/dev/null || true
+            
+            echo "### Docker cleanup completed. Current usage: ###"
+            docker system df
+        fi
 
         if [ $INFER_STATUS -eq 0 ]; then
             echo "### Inference completed successfully. ###"
@@ -127,12 +169,23 @@ for run_idx in $(seq 1 $N_RUNS); do
 
         ./evaluation/utils/scripts/cleanup_remote_runtime.sh
 
-        # # Also cleanup local docker containers if running locally
-        # if [ "$RUNTIME" = "docker" ]; then
-        #     echo "### Cleaning up local docker containers... ###"
-        #     docker ps -q --filter "name=openhands-runtime-" | xargs -r docker stop
-        #     docker ps -aq --filter "name=openhands-runtime-" | xargs -r docker rm
-        # fi
+        # Also cleanup local docker containers and images if running locally
+        if [ "$RUNTIME" = "docker" ]; then
+            echo "### Cleaning up local docker containers... ###"
+            docker ps -q --filter "name=openhands-runtime-" | xargs -r docker stop
+            docker ps -aq --filter "name=openhands-runtime-" | xargs -r docker rm
+            
+            echo "### Cleaning up SWE-bench related docker images... ###"
+            # Only remove images from the evaluation registry to avoid affecting other processes
+            docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
+            
+            echo "### Pruning dangling images and build cache... ###"
+            docker image prune -f 2>/dev/null || true
+            docker builder prune -f --filter "until=1h" 2>/dev/null || true
+            
+            echo "### Docker cleanup completed. Current usage: ###"
+            docker system df
+        fi
     done
 
     # update the output with evaluation results
