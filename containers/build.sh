@@ -167,6 +167,7 @@ echo "Building for platform(s): $platform"
 
 docker buildx build \
   $args \
+  --network host \
   --build-arg OPENHANDS_BUILD_VERSION="$OPENHANDS_BUILD_VERSION" \
   --cache-from=type=registry,ref=$DOCKER_REPOSITORY:$cache_tag \
   --cache-from=type=registry,ref=$DOCKER_REPOSITORY:$cache_tag_base-main \

@@ -141,6 +141,10 @@ class DockerRuntimeBuilder(RuntimeBuilder):
         if platform:
             buildx_cmd.append(f'--platform={platform}')
 
+        # Add --network host to fix DNS resolution in DinD environments (OpenPAI/Kubernetes with Cilium)
+        # This allows the build process to use the host's network namespace where DNS resolution works
+        buildx_cmd.append('--network=host')
+
         cache_dir = '/tmp/.buildx-cache'
         if use_local_cache and self._is_cache_usable(cache_dir):
             buildx_cmd.extend(

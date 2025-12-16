@@ -48,7 +48,7 @@ RUN rm {datum['test_file']}
 def build_and_push_image(dockerfile_content, image_name):
     with open('Dockerfile.temp', 'w') as dockerfile:
         dockerfile.write(dockerfile_content)
-    run_command(f'docker build -f Dockerfile.temp -t {image_name} .')
+    run_command(f'docker build --network host -f Dockerfile.temp -t {image_name} .')
     run_command(f'docker push {image_name}')
     run_command(f'docker rmi {image_name}')
     os.remove('Dockerfile.temp')
