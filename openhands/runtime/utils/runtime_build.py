@@ -225,11 +225,10 @@ def build_runtime_image_in_folder(
         logger.debug(f'Reusing local image [{hash_image_name}]')
         return hash_image_name
 
+    prebuild_image_tag = base_image.replace('/', '_').replace(':', '_')
+    prebuild_image_name = f'{runtime_image_repo}:{prebuild_image_tag}'
     # BLOB IMAGE LOADING: Try to load from Azure Blob Storage before pulling from registry
     if is_blob_image_loading_enabled():
-        prebuild_image_tag = base_image.replace('/', '_').replace(':', '_')
-        prebuild_repo_name = runtime_image_repo.split('/')[1]
-        prebuild_image_name = f'{prebuild_repo_name}:{prebuild_image_tag}'
         logger.info(
             f'Blob image loading enabled. Checking for prebuilt image in blob storage: {prebuild_image_name}'
         )

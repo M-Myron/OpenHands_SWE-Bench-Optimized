@@ -129,6 +129,9 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
             - success: True if image was successfully loaded
             - local_tarball_path: Path to the local tarball copy (for cleanup), or None if failed
     """
+    # remove docker.io prefix if present
+    if image_name.startswith('docker.io/'):
+        image_name = image_name[len('docker.io/'):]
     tarball_path = find_blob_image_tarball(image_name)
     if not tarball_path:
         return False, None
