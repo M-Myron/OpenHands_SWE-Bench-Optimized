@@ -87,7 +87,7 @@ def find_blob_image_tarball(image_name: str) -> str | None:
     blob_mount_dir = get_blob_mount_dir()
     images_dir = os.path.join(blob_mount_dir, get_blob_images_subdir())
     tarball_name = get_image_tarball_name(image_name)
-    logger.info(f'Looking for prebuilt image tarball in blob storage: {image_name}')
+    logger.info(f'Looking for prebuilt image tarball ({tarball_name}) in blob storage at {images_dir}')
     tarball_path = os.path.join(images_dir, tarball_name)
 
     if os.path.exists(tarball_path):
