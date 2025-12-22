@@ -246,7 +246,7 @@ def build_runtime_image_in_folder(
                         logger.debug(f'Cleaned up tarball after load: {tarball_path}')
                 except Exception as e:
                     logger.debug(f'Failed to cleanup tarball: {e}')
-            return hash_image_name
+            return prebuild_image_name
 
         logger.info(
             f'No prebuilt images found in blob storage for {base_image}.'
