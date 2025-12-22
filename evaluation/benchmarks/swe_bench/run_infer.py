@@ -63,6 +63,10 @@ from openhands.events.observation import (
 )
 from openhands.events.serialization.event import event_from_dict, event_to_dict
 from openhands.runtime.base import Runtime
+from openhands.runtime.utils.blob_image_loader import (
+    cleanup_local_temp_dir,
+    remove_docker_image,
+)
 from openhands.utils.async_utils import call_async_from_sync
 from openhands.utils.shutdown_listener import sleep_if_should_continue
 
@@ -613,6 +617,10 @@ def process_instance(
     runtime_failure_count: int = 0,
 ) -> EvalOutput:
     config = get_config(instance, metadata)
+    
+    # Track images used by this instance for cleanup
+    base_image = config.sandbox.base_container_image
+    runtime_image = None
 
     # Setup the logger properly, so you can run multi-processing to parallelize the evaluation
     if reset_logger:
@@ -639,6 +647,10 @@ def process_instance(
 
     runtime = create_runtime(config)
     call_async_from_sync(runtime.connect)
+    
+    # Get the actual runtime image that was built/loaded
+    if hasattr(runtime, 'runtime_container_image'):
+        runtime_image = runtime.runtime_container_image
 
     try:
         initialize_runtime(runtime, instance, metadata)
@@ -676,6 +688,27 @@ def process_instance(
         )
     finally:
         runtime.close()
+        
+        # Clean up resources for this instance to prevent accumulation
+        # This is safe for parallel execution as each process has its own temp dir
+        try:
+            # 1. Clean up process-specific temp directory (tarball copies)
+            cleanup_local_temp_dir()
+            
+            # 2. Remove Docker images used by this instance (best effort)
+            # Only remove if blob loading was used (don't remove images from registry)
+            from openhands.runtime.utils.blob_image_loader import is_blob_image_loading_enabled
+            if is_blob_image_loading_enabled():
+                # Remove runtime image (wrapper image built on top of base)
+                if runtime_image:
+                    logger.info(f'Attempting to remove runtime image to free space: {runtime_image}')
+                    remove_docker_image(runtime_image, force=False)
+                
+                # Note: We don't remove base_image as it might be shared across instances
+                # Base images are expected to be cleaned up by the periodic cleanup in run_infer.sh
+                
+        except Exception as e:
+            logger.warning(f'Failed to cleanup resources for instance {instance.instance_id}: {e}')
     # ==========================================
 
     # ======= Attempt to evaluate the agent's edits =======

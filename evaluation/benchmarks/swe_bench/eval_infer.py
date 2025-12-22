@@ -33,6 +33,7 @@ from openhands.core.logger import openhands_logger as logger
 from openhands.core.main import create_runtime
 from openhands.events.action import CmdRunAction
 from openhands.events.observation import CmdOutputObservation
+from openhands.runtime.utils.blob_image_loader import cleanup_local_temp_dir
 from openhands.utils.async_utils import call_async_from_sync
 
 # TODO: migrate all swe-bench docker to ghcr.io/openhands
@@ -346,6 +347,11 @@ def process_instance(
             )
     finally:
         runtime.close()
+        # Clean up local temp directory used for blob images after each instance
+        try:
+            cleanup_local_temp_dir()
+        except Exception as e:
+            logger.warning(f'Failed to cleanup blob image temp directory: {e}')
 
 
 if __name__ == '__main__':

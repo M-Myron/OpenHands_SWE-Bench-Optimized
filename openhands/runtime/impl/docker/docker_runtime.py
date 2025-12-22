@@ -481,7 +481,7 @@ class DockerRuntime(ActionExecutionClient):
         self.log('debug', f'Workspace Base: {self.config.workspace_base}')
 
         # Process volumes for mounting
-        volumes = self._process_volumes()
+        volumes = self._process_volumes()                                 
 
         # If no volumes were configured, set to None
         if not volumes:

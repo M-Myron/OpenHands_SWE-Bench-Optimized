@@ -15,6 +15,10 @@ import openhands
 from openhands.core.exceptions import AgentRuntimeBuildError
 from openhands.core.logger import openhands_logger as logger
 from openhands.runtime.builder import DockerRuntimeBuilder, RuntimeBuilder
+from openhands.runtime.utils.blob_image_loader import (
+    is_blob_image_loading_enabled,
+    load_image_from_blob,
+)
 from openhands.version import get_version
 
 
@@ -221,9 +225,67 @@ def build_runtime_image_in_folder(
         logger.debug(f'Reusing local image [{hash_image_name}]')
         return hash_image_name
 
-    # If not found locally, try to pull from remote registry
+    # BLOB IMAGE LOADING: Try to load from Azure Blob Storage before pulling from registry
+    if is_blob_image_loading_enabled():
+        logger.info(
+            f'Blob image loading enabled. Checking for prebuilt image in blob storage: {hash_image_name}'
+        )
+        # Try to load the exact hash image first
+        success, tarball_path = load_image_from_blob(hash_image_name)
+        if success:
+            # Verify the image was loaded successfully
+            if runtime_builder.image_exists(hash_image_name, pull_from_repo=False):
+                logger.info(
+                    f'✅ Successfully loaded and verified prebuilt image from blob storage: {hash_image_name}'
+                )
+                # Clean up the tarball immediately after successful load
+                if tarball_path:
+                    try:
+                        import os
+                        if os.path.exists(tarball_path):
+                            os.remove(tarball_path)
+                            logger.debug(f'Cleaned up tarball after load: {tarball_path}')
+                    except Exception as e:
+                        logger.debug(f'Failed to cleanup tarball: {e}')
+                return hash_image_name
+            else:
+                logger.warning(
+                    f'Image was loaded from blob but verification failed: {hash_image_name}'
+                )
+        
+        # Try to load the lock image if hash image wasn't found
+        logger.info(
+            f'Hash image not found in blob storage, checking for lock image: {lock_image_name}'
+        )
+        success, tarball_path = load_image_from_blob(lock_image_name)
+        if success:
+            # Verify the image was loaded successfully
+            if runtime_builder.image_exists(lock_image_name, pull_from_repo=False):
+                logger.info(
+                    f'✅ Successfully loaded and verified prebuilt lock image from blob storage: {lock_image_name}'
+                )
+                # Clean up the tarball immediately after successful load
+                if tarball_path:
+                    try:
+                        import os
+                        if os.path.exists(tarball_path):
+                            os.remove(tarball_path)
+                            logger.debug(f'Cleaned up tarball after load: {tarball_path}')
+                    except Exception as e:
+                        logger.debug(f'Failed to cleanup tarball: {e}')
+                return lock_image_name
+            else:
+                logger.warning(
+                    f'Lock image was loaded from blob but verification failed: {lock_image_name}'
+                )
+        
+        logger.info(
+            f'No prebuilt images found in blob storage for {hash_image_name} or {lock_image_name}'
+        )
+
+    # If not found locally or in blob, try to pull from remote registry
     logger.info(
-        f'Image [{hash_image_name}] for base [{base_image}] not found locally, checking remote registry...'
+        f'Image [{hash_image_name}] for base [{base_image}] not found locally or in blob, checking remote registry...'
     )
     try:
         if runtime_builder.image_exists(hash_image_name, pull_from_repo=True):

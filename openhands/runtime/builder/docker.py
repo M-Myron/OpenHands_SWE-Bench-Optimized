@@ -9,6 +9,10 @@ from openhands.core.exceptions import AgentRuntimeBuildError
 from openhands.core.logger import RollingLogger
 from openhands.core.logger import openhands_logger as logger
 from openhands.runtime.builder.base import RuntimeBuilder
+from openhands.runtime.utils.blob_image_loader import (
+    is_blob_image_loading_enabled,
+    load_image_from_blob,
+)
 from openhands.utils.term_color import TermColor, colorize
 from openhands.version import get_version
 
@@ -276,9 +280,37 @@ class DockerRuntimeBuilder(RuntimeBuilder):
                     f'Image {image_name} {colorize("not found", TermColor.WARNING)} locally'
                 )
                 return False
+            
+            # BLOB IMAGE LOADING: Try to load from blob storage before pulling from registry
+            if is_blob_image_loading_enabled():
+                logger.info(
+                    f'Image not found locally. Checking blob storage before trying registry: {image_name}'
+                )
+                success, tarball_path = load_image_from_blob(image_name)
+                if success:
+                    # Verify the image was loaded successfully
+                    try:
+                        self.docker_client.images.get(image_name)
+                        logger.info(
+                            f'✅ Successfully loaded and verified image from blob storage: {image_name}'
+                        )
+                        # Clean up the tarball immediately after successful load
+                        if tarball_path and os.path.exists(tarball_path):
+                            try:
+                                os.remove(tarball_path)
+                                logger.debug(f'Cleaned up tarball after load: {tarball_path}')
+                            except Exception as e:
+                                logger.debug(f'Failed to cleanup tarball: {e}')
+                        return True
+                    except docker.errors.ImageNotFound:
+                        logger.warning(
+                            f'Image was loaded from blob but verification failed: {image_name}'
+                        )
+            
+            # Try to pull from remote registry
             try:
                 logger.debug(
-                    'Image not found locally. Trying to pull it, please wait...'
+                    'Image not found locally or in blob. Trying to pull from registry, please wait...'
                 )
 
                 layers: dict[str, dict[str, str]] = {}

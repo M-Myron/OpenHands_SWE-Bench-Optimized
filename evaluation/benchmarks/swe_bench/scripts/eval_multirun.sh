@@ -45,15 +45,15 @@ if [[ "$BASE_DIR" == *"*"* ]] || [[ "$BASE_DIR" == *"?"* ]]; then
     echo "Pattern detected in BASE_DIR: $BASE_DIR"
     # Find all matching directories
     MATCHING_DIRS=($(find "$(dirname "$BASE_DIR")" -maxdepth 1 -type d -name "$(basename "$BASE_DIR")" 2>/dev/null | sort))
-    
+
     if [ ${#MATCHING_DIRS[@]} -eq 0 ]; then
         echo "Error: No directories found matching pattern: $BASE_DIR"
         exit 1
     fi
-    
+
     echo "Found ${#MATCHING_DIRS[@]} directories matching pattern"
     echo ""
-    
+
     RUN_DIRS=("${MATCHING_DIRS[@]}")
 else
     # Check if it's a specific run directory (contains output.jsonl)
@@ -63,18 +63,18 @@ else
     else
         # Look for run subdirectories (run_1, run_2, etc.)
         RUN_DIRS=($(find "$BASE_DIR" -maxdepth 1 -type d -name "*run_*" 2>/dev/null | sort))
-        
+
         if [ ${#RUN_DIRS[@]} -eq 0 ]; then
             # Try direct subdirectories with output.jsonl
             RUN_DIRS=($(find "$BASE_DIR" -maxdepth 1 -mindepth 1 -type d -exec test -f '{}/output.jsonl' \; -print 2>/dev/null | sort))
         fi
-        
+
         if [ ${#RUN_DIRS[@]} -eq 0 ]; then
             echo "Error: No run directories found in $BASE_DIR"
             echo "Looking for directories containing output.jsonl"
             exit 1
         fi
-        
+
         echo "Found ${#RUN_DIRS[@]} run directories"
         echo ""
     fi
@@ -110,13 +110,13 @@ echo ""
 for i in "${!RUN_DIRS[@]}"; do
     RUN_DIR="${RUN_DIRS[$i]}"
     RUN_NUM=$((i+1))
-    
+
     echo "=============================================================="
     echo "[$RUN_NUM/$TOTAL_RUNS] Evaluating: $(basename "$RUN_DIR")"
     echo "=============================================================="
-    
+
     OUTPUT_FILE="$RUN_DIR/output.jsonl"
-    
+
     if [ ! -f "$OUTPUT_FILE" ]; then
         echo "Error: output.jsonl not found in $RUN_DIR"
         FAILED_RUNS=$((FAILED_RUNS + 1))
@@ -124,7 +124,7 @@ for i in "${!RUN_DIRS[@]}"; do
         echo ""
         continue
     fi
-    
+
     # # Check if already evaluated
     # if [ -f "$RUN_DIR/report.json" ]; then
     #     read -p "Report already exists. Re-evaluate? (y/n) " -n 1 -r
@@ -135,16 +135,16 @@ for i in "${!RUN_DIRS[@]}"; do
     #         continue
     #     fi
     # fi
-    
+
     # Run evaluation
     START_TIME=$(date +%s)
-    
+
     "$EVAL_INFER_SCRIPT" "$OUTPUT_FILE" "" "$DATASET_NAME" "$SPLIT" "$ENVIRONMENT"
     EXIT_CODE=$?
-    
+
     END_TIME=$(date +%s)
     DURATION=$((END_TIME - START_TIME))
-    
+
     if [ $EXIT_CODE -eq 0 ]; then
         echo "✓ Successfully evaluated in ${DURATION}s"
         SUCCESSFUL_RUNS=$((SUCCESSFUL_RUNS + 1))
@@ -153,7 +153,7 @@ for i in "${!RUN_DIRS[@]}"; do
         FAILED_RUNS=$((FAILED_RUNS + 1))
         FAILED_DIRS+=("$RUN_DIR")
     fi
-    
+
     echo ""
 done
 

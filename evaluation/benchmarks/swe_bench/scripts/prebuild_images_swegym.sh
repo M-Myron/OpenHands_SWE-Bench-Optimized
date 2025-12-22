@@ -5,7 +5,7 @@ set -eo pipefail
 export DATASET=${1:-"SWE-Gym/SWE-Gym"}
 export SPLIT=${2:-"train"}
 export NUM_WORKERS=${3:-4}
-export EVAL_LIMIT=${4:-500}
+export EVAL_LIMIT=${4:-3000}
 
 # Set appropriate image prefix based on runtime
 # if [ -n "$ALLHANDS_API_KEY" ]; then
