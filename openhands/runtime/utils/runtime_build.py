@@ -228,7 +228,8 @@ def build_runtime_image_in_folder(
     # BLOB IMAGE LOADING: Try to load from Azure Blob Storage before pulling from registry
     if is_blob_image_loading_enabled():
         prebuild_image_tag = base_image.replace('/', '_').replace(':', '_')
-        prebuild_image_name = f'{runtime_image_repo}:{prebuild_image_tag}'
+        prebuild_repo_name = runtime_image_repo.split('/')[1]
+        prebuild_image_name = f'{prebuild_repo_name}:{prebuild_image_tag}'
         logger.info(
             f'Blob image loading enabled. Checking for prebuilt image in blob storage: {prebuild_image_name}'
         )
@@ -247,7 +248,7 @@ def build_runtime_image_in_folder(
                 except Exception as e:
                     logger.debug(f'Failed to cleanup tarball: {e}')
             return hash_image_name
-        
+
         logger.info(
             f'No prebuilt images found in blob storage for {base_image}.'
         )
