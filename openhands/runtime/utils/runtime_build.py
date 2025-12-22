@@ -238,6 +238,26 @@ def build_runtime_image_in_folder(
             logger.info(
                 f'✅ Successfully loaded prebuilt image from blob storage: {prebuild_image_name}'
             )
+
+            # Re-tag the loaded image to match the expected hash_image_name
+            # This is necessary because the tarball contains the image with prebuild_image_name tag
+            # but the runtime expects it with hash_image_name tag
+            try:
+                # Get the Docker client from runtime_builder
+                docker_client = runtime_builder.docker_client
+                loaded_image = docker_client.images.get(prebuild_image_name)
+                loaded_image.tag(runtime_image_repo, source_tag)
+                loaded_image.tag(runtime_image_repo, lock_tag)
+                if versioned_tag:
+                    loaded_image.tag(runtime_image_repo, versioned_tag)
+                logger.debug(
+                    f'Re-tagged blob image {prebuild_image_name} as {hash_image_name}'
+                )
+            except Exception as e:
+                logger.warning(
+                    f'Failed to re-tag blob image, but continuing: {e}'
+                )
+
             # Clean up the tarball immediately after successful load
             if tarball_path:
                 try:
@@ -246,7 +266,8 @@ def build_runtime_image_in_folder(
                         logger.debug(f'Cleaned up tarball after load: {tarball_path}')
                 except Exception as e:
                     logger.debug(f'Failed to cleanup tarball: {e}')
-            return prebuild_image_name
+
+            return hash_image_name
 
         logger.info(
             f'No prebuilt images found in blob storage for {base_image}.'
