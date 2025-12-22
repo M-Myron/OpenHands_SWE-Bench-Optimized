@@ -227,60 +227,29 @@ def build_runtime_image_in_folder(
 
     # BLOB IMAGE LOADING: Try to load from Azure Blob Storage before pulling from registry
     if is_blob_image_loading_enabled():
+        prebuild_image_tag = base_image.replace('/', '_').replace(':', '_')
+        prebuild_image_name = f'{runtime_image_repo}:{prebuild_image_tag}'
         logger.info(
-            f'Blob image loading enabled. Checking for prebuilt image in blob storage: {hash_image_name}'
+            f'Blob image loading enabled. Checking for prebuilt image in blob storage: {prebuild_image_name}'
         )
-        # Try to load the exact hash image first
-        success, tarball_path = load_image_from_blob(hash_image_name)
+        # Try to load the prebuilt image from blob
+        success, tarball_path = load_image_from_blob(prebuild_image_name)
         if success:
-            # Verify the image was loaded successfully
-            if runtime_builder.image_exists(hash_image_name, pull_from_repo=False):
-                logger.info(
-                    f'✅ Successfully loaded and verified prebuilt image from blob storage: {hash_image_name}'
-                )
-                # Clean up the tarball immediately after successful load
-                if tarball_path:
-                    try:
-                        import os
-                        if os.path.exists(tarball_path):
-                            os.remove(tarball_path)
-                            logger.debug(f'Cleaned up tarball after load: {tarball_path}')
-                    except Exception as e:
-                        logger.debug(f'Failed to cleanup tarball: {e}')
-                return hash_image_name
-            else:
-                logger.warning(
-                    f'Image was loaded from blob but verification failed: {hash_image_name}'
-                )
-        
-        # Try to load the lock image if hash image wasn't found
-        logger.info(
-            f'Hash image not found in blob storage, checking for lock image: {lock_image_name}'
-        )
-        success, tarball_path = load_image_from_blob(lock_image_name)
-        if success:
-            # Verify the image was loaded successfully
-            if runtime_builder.image_exists(lock_image_name, pull_from_repo=False):
-                logger.info(
-                    f'✅ Successfully loaded and verified prebuilt lock image from blob storage: {lock_image_name}'
-                )
-                # Clean up the tarball immediately after successful load
-                if tarball_path:
-                    try:
-                        import os
-                        if os.path.exists(tarball_path):
-                            os.remove(tarball_path)
-                            logger.debug(f'Cleaned up tarball after load: {tarball_path}')
-                    except Exception as e:
-                        logger.debug(f'Failed to cleanup tarball: {e}')
-                return lock_image_name
-            else:
-                logger.warning(
-                    f'Lock image was loaded from blob but verification failed: {lock_image_name}'
-                )
+            logger.info(
+                f'✅ Successfully loaded prebuilt image from blob storage: {prebuild_image_name}'
+            )
+            # Clean up the tarball immediately after successful load
+            if tarball_path:
+                try:
+                    if os.path.exists(tarball_path):
+                        os.remove(tarball_path)
+                        logger.debug(f'Cleaned up tarball after load: {tarball_path}')
+                except Exception as e:
+                    logger.debug(f'Failed to cleanup tarball: {e}')
+            return hash_image_name
         
         logger.info(
-            f'No prebuilt images found in blob storage for {hash_image_name} or {lock_image_name}'
+            f'No prebuilt images found in blob storage for {base_image}.'
         )
 
     # If not found locally or in blob, try to pull from remote registry
