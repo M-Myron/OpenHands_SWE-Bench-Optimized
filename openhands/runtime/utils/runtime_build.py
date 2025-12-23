@@ -272,6 +272,8 @@ def build_runtime_image_in_folder(
         logger.info(
             f'No prebuilt images found in blob storage for {base_image}.'
         )
+    else:
+        logger.info('Blob image loading not enabled, skipping blob storage check.')
 
     # If not found locally or in blob, try to pull from remote registry
     logger.info(
