@@ -288,9 +288,30 @@ def build_runtime_image_in_folder(
                 f'✅ Successfully pulled prebuilt lock image from registry: [{lock_image_name}]'
             )
             return lock_image_name
+        elif runtime_builder.image_exists(prebuild_image_name, pull_from_repo=True):
+            logger.info(
+                f'✅ Successfully pulled prebuilt versioned image from registry: [{prebuild_image_name}]'
+            )
+            # # Re-tag the pulled image to match the expected hash_image_name
+            # try:
+            #     # Get the Docker client from runtime_builder
+            #     docker_client = runtime_builder.docker_client
+            #     pulled_image = docker_client.images.get(prebuild_image_name)
+            #     pulled_image.tag(runtime_image_repo, source_tag)
+            #     pulled_image.tag(runtime_image_repo, lock_tag)
+            #     if versioned_tag:
+            #         pulled_image.tag(runtime_image_repo, versioned_tag)
+            #     logger.debug(
+            #         f'Re-tagged pulled image {prebuild_image_name} as {hash_image_name}'
+            #     )
+            # except Exception as e:
+            #     logger.warning(
+            #         f'Failed to re-tag pulled image, but continuing: {e}'
+            #     )
+            return prebuild_image_name
         else:
             logger.info(
-                f'Image [{hash_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
+                f'Image [{prebuild_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
             )
     except Exception as e:
         error_str = str(e).lower()
