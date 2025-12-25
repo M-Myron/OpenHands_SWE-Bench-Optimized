@@ -344,6 +344,7 @@ def load_replay_log(trajectory_path: str) -> tuple[list[Event] | None, Action]:
 
         with open(path, 'r', encoding='utf-8') as file:
             events = ReplayManager.get_replay_events(json.load(file))
+            events = events[1:]
             assert isinstance(events[0], MessageAction)
             return events[1:], events[0]
     except json.JSONDecodeError as e:
