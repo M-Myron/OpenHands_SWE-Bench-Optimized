@@ -14,6 +14,9 @@ export EXP_NAME=$EXP_NAME
 # use 2x resources for rollout since some codebases are pretty resource-intensive
 export DEFAULT_RUNTIME_RESOURCE_FACTOR=2
 export ITERATIVE_EVAL_MODE=false
+# Skip instances that reach maximum retries instead of crashing the entire evaluation
+# Failed instances will be logged to maximum_retries_exceeded.jsonl
+export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 echo "MODEL: $MODEL"
 echo "EXP_NAME: $EXP_NAME"
 DATASET="SWE-Gym/SWE-Gym"  # change this to the "/SWE-Gym-Lite" if you want to rollout the lite subset
