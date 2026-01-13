@@ -752,7 +752,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--dataset',
         type=str,
-        default='princeton-nlp/SWE-bench',
+        default='princeton-nlp/SWE-bench_Verified',
         help='data set to evaluate on, either full-test or lite-test',
     )
     parser.add_argument(
@@ -866,7 +866,7 @@ if __name__ == '__main__':
         #     swe_bench_tests,
         #     output_file,
         #     eval_n_limit=1,
-        #     eval_ids=['django__django-15930'],
+        #     eval_ids=['django__django-12663'],
         # )
         if len(instances) > 0 and not isinstance(
             instances['PASS_TO_PASS'][instances['PASS_TO_PASS'].index[0]], str

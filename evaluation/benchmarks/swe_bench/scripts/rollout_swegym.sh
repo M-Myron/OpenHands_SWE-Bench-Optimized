@@ -29,7 +29,7 @@ else
     export EVAL_DOCKER_IMAGE_PREFIX="us-central1-docker.pkg.dev/evaluation-092424/swe-bench-images"
 fi
 
-EVAL_LIMIT=500
+EVAL_LIMIT=3000
 MAX_ITER=100
 
 
