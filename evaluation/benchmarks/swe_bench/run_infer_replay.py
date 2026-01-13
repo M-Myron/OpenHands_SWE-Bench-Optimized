@@ -278,7 +278,8 @@ def get_config(
         metadata.eval_output_dir,
         'replay_trajectories'
     )
-    config.replay_trajectory_path = replay_trajectory_path
+    if os.path.exists(replay_trajectory_path):
+        config.replay_trajectory_path = replay_trajectory_path
 
     return config
 
@@ -671,7 +672,7 @@ def process_instance(
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
         if config.replay_trajectory_path is not None:
             # set message_action to None to use the replay trajectory
-            message_action = NullAction()  # Create instance, not class reference
+            message_action = NullAction()
         state: State | None = asyncio.run(
             run_controller(
                 config=config,
@@ -912,12 +913,12 @@ if __name__ == '__main__':
     if not ITERATIVE_EVAL_MODE:
         # load the dataset
         instances = prepare_dataset(swe_bench_tests, output_file, args.eval_n_limit)
-        # # debug
+        # # debug: test single instance
         instances = prepare_dataset(
             swe_bench_tests,
             output_file,
             eval_n_limit=1,
-            eval_ids=['django__django-12663'],
+            eval_ids=['pytest-dev__pytest-5262'],
         )
         if len(instances) > 0 and not isinstance(
             instances['PASS_TO_PASS'][instances['PASS_TO_PASS'].index[0]], str

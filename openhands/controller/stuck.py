@@ -152,7 +152,7 @@ class StuckDetector:
             )
 
             if actions_equal and observations_equal:
-                logger.warning('Action, Observation loop detected')
+                logger.warning(f'Action, Observation loop detected for event: {last_actions[0].id}')
                 self.stuck_analysis = StuckDetector.StuckAnalysis(
                     loop_type='repeating_action_observation',
                     loop_repeat_times=4,

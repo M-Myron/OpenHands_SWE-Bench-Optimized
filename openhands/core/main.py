@@ -344,9 +344,10 @@ def load_replay_log(trajectory_path: str) -> tuple[list[Event] | None, Action]:
 
         with open(path, 'r', encoding='utf-8') as file:
             events = ReplayManager.get_replay_events(json.load(file))
-            events = events[1:]
+            events = events[1:] # exclude the first event which is the system prompt
             assert isinstance(events[0], MessageAction)
-            return events[1:], events[0]
+            # initial user action will trigger recallaction, need to skip it
+            return events[2:], events[0]
     except json.JSONDecodeError as e:
         raise ValueError(f'Invalid JSON format in {trajectory_path}: {e}')
 
