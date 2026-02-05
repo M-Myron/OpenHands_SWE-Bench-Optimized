@@ -21,10 +21,35 @@ cd /home/v-murongma/code/OpenHands_SWE-Bench-Optimized
 pip install anthropic flask
 ```
 
-### Step 2: Start the Proxy Server
+### Step 2: Configure Environment Variables
+
+**IMPORTANT**: Never commit API keys to git!
+
+1. Copy the example environment file:
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and add your actual API key:
+```bash
+CLAUDE_API_KEY=your-actual-api-key-here
+CLAUDE_RESOURCE=lucia-claude-eastus2
+```
+
+3. Load the environment variables:
+```bash
+# In your shell
+export CLAUDE_API_KEY='your-actual-api-key-here'
+export CLAUDE_RESOURCE='lucia-claude-eastus2'
+
+# Or use dotenv
+source .env  # if your shell supports this
+```
+
+### Step 3: Start the Proxy Server
 
 ```bash
-# Start on default port 8001
+# Make sure CLAUDE_API_KEY is set in your environment first!
 ./start_claude_proxy.sh
 
 # Or specify a custom port
@@ -48,7 +73,7 @@ Configure OpenHands with:
 ==============================================================
 ```
 
-### Step 3: Configure OpenHands (Already Done!)
+### Step 4: Configure OpenHands (Already Done!)
 
 The `config.toml` has been updated to use the proxy:
 
