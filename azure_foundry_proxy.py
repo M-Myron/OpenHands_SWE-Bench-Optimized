@@ -21,8 +21,9 @@ import json
 import os
 import time
 from typing import Optional
+from functools import wraps
 
-from anthropic import AnthropicFoundry
+from anthropic import AnthropicFoundry, RateLimitError
 from flask import Flask, request, jsonify, Response
 import uuid
 
@@ -46,6 +47,55 @@ MODEL_MAPPING = {
     "gpt-4": "claude-sonnet-4-5",  # Alias
     "gpt-3.5-turbo": "claude-haiku-4-5",  # Alias
 }
+
+# Rate limiting configuration
+MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "5"))
+INITIAL_RETRY_DELAY = float(os.getenv("PROXY_INITIAL_RETRY_DELAY", "5.0"))
+MAX_RETRY_DELAY = float(os.getenv("PROXY_MAX_RETRY_DELAY", "120.0"))
+
+
+def retry_with_backoff(func):
+    """Decorator to retry API calls with exponential backoff on rate limit errors."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        retry_count = 0
+        delay = INITIAL_RETRY_DELAY
+        
+        while retry_count <= MAX_RETRIES:
+            try:
+                return func(*args, **kwargs)
+            except RateLimitError as e:
+                retry_count += 1
+                if retry_count > MAX_RETRIES:
+                    print(f"[Proxy] Max retries ({MAX_RETRIES}) reached. Giving up.")
+                    raise
+                
+                # Extract wait time from error message if available
+                error_msg = str(e)
+                wait_time = delay
+                if "60 seconds" in error_msg.lower():
+                    wait_time = 60
+                elif "please wait" in error_msg.lower():
+                    # Try to extract number from message
+                    import re
+                    match = re.search(r'wait (\d+) seconds', error_msg.lower())
+                    if match:
+                        wait_time = int(match.group(1))
+                
+                wait_time = min(wait_time, MAX_RETRY_DELAY)
+                
+                print(f"[Proxy] Rate limit hit (attempt {retry_count}/{MAX_RETRIES})")
+                print(f"[Proxy] Waiting {wait_time} seconds before retry...")
+                print(f"[Proxy] Error: {error_msg}")
+                
+                time.sleep(wait_time)
+                
+                # Exponential backoff for next attempt
+                delay = min(delay * 2, MAX_RETRY_DELAY)
+        
+        return func(*args, **kwargs)
+    
+    return wrapper
 
 
 def convert_openai_to_anthropic_messages(openai_messages):
@@ -149,9 +199,13 @@ def chat_completions():
             # Anthropic supports stop_sequences
             api_params["stop_sequences"] = stop if isinstance(stop, list) else [stop]
         
-        # Call Anthropic API
+        # Call Anthropic API with retry logic
+        @retry_with_backoff
+        def make_api_call():
+            return client.messages.create(**api_params)
+        
         api_call_start = time.time()
-        response = client.messages.create(**api_params)
+        response = make_api_call()
         api_call_time = time.time() - api_call_start
         
         # Convert response
@@ -172,6 +226,18 @@ def chat_completions():
         print(f"{'='*70}\n")
         
         return jsonify(openai_response)
+    
+    except RateLimitError as e:
+        print(f"[Proxy] Rate Limit Error (after retries): {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": {
+                "message": f"Rate limit exceeded after {MAX_RETRIES} retries: {str(e)}",
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded"
+            }
+        }), 429
     
     except Exception as e:
         print(f"[Proxy] Error: {e}")
@@ -220,6 +286,11 @@ if __name__ == '__main__':
     print(f"Resource: {CLAUDE_RESOURCE}")
     print(f"Listening on: http://{args.host}:{args.port}")
     print("")
+    print("Rate Limiting Configuration:")
+    print(f"  Max Retries: {MAX_RETRIES}")
+    print(f"  Initial Retry Delay: {INITIAL_RETRY_DELAY}s")
+    print(f"  Max Retry Delay: {MAX_RETRY_DELAY}s")
+    print("")
     print("OpenAI-compatible endpoint:")
     print(f"  http://localhost:{args.port}/v1/chat/completions")
     print("")
@@ -227,6 +298,11 @@ if __name__ == '__main__':
     print(f'  model="openai/claude-sonnet-4-5"')
     print(f'  base_url="http://localhost:{args.port}/v1"')
     print(f'  api_key="dummy"')
+    print("")
+    print("Environment Variables:")
+    print("  PROXY_MAX_RETRIES - Maximum retry attempts (default: 5)")
+    print("  PROXY_INITIAL_RETRY_DELAY - Initial retry delay in seconds (default: 5.0)")
+    print("  PROXY_MAX_RETRY_DELAY - Maximum retry delay in seconds (default: 120.0)")
     print("=" * 70)
     
     app.run(host=args.host, port=args.port, debug=False)

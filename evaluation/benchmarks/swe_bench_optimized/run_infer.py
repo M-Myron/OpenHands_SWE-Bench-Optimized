@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import tempfile
+import time
 from typing import Any, Literal
 
 import pandas as pd
@@ -860,27 +861,87 @@ if __name__ == '__main__':
         # For each batch, run all N runs before moving to next batch
         batch_size = args.eval_num_workers
         total_instances = len(swe_bench_tests)
+        total_batches = (total_instances + batch_size - 1) // batch_size  # Ceiling division
+        total_runs = n_runs - len(skip_runs)
+        
+        logger.info(f'=' * 80)
+        logger.info(f'EVALUATION PLAN:')
+        logger.info(f'  Total instances: {total_instances}')
+        logger.info(f'  Batch size (workers): {batch_size}')
+        logger.info(f'  Total batches: {total_batches}')
+        logger.info(f'  Runs per instance: {n_runs}')
+        logger.info(f'  Active runs: {total_runs} (skipping: {skip_runs if skip_runs else "none"})')
+        logger.info(f'  Total evaluations: {total_instances * total_runs}')
+        logger.info(f'=' * 80)
+        
+        # Initialize timing tracking
+        start_time = time.time()
+        completed_evaluations = 0
+        evaluation_times = []  # Track time per evaluation for better estimates
         
         # Split instances into batches
         for batch_start in range(0, total_instances, batch_size):
             batch_end = min(batch_start + batch_size, total_instances)
             batch_instances = swe_bench_tests.iloc[batch_start:batch_end]
+            batch_num = batch_start // batch_size + 1
             
-            logger.info(f'Processing batch {batch_start//batch_size + 1}: instances {batch_start+1} to {batch_end} of {total_instances}')
+            logger.info('')
+            logger.info(f'╔═══════════════════════════════════════════════════════════════════════════╗')
+            logger.info(f'║ BATCH {batch_num}/{total_batches}: Processing instances {batch_start+1}-{batch_end} of {total_instances}')
+            logger.info(f'╚═══════════════════════════════════════════════════════════════════════════╝')
             
             # For each run, process all instances in this batch
             for run_id in range(1, n_runs + 1):
                 if run_id in skip_runs:
-                    logger.info(f'Skipping run {run_id} for batch {batch_start//batch_size + 1}')
+                    logger.info(f'  ⊘ Skipping run {run_id}/{n_runs} for batch {batch_num}/{total_batches}')
                     continue
                 
                 # Adjust eval_note for each run to create separate output directories
                 # This maintains the same output structure as the original multi-run implementation
                 if n_runs > 1:
                     run_eval_note = f'{args.eval_note}-run_{run_id}'
-                    logger.info(f'Starting run {run_id}/{n_runs} for batch {batch_start//batch_size + 1} with eval_note: {run_eval_note}')
+                    
+                    # Helper function to format time
+                    def format_time(seconds):
+                        if seconds < 60:
+                            return f'{int(seconds)}s'
+                        elif seconds < 3600:
+                            return f'{int(seconds // 60)}m {int(seconds % 60)}s'
+                        else:
+                            hours = int(seconds // 3600)
+                            minutes = int((seconds % 3600) // 60)
+                            return f'{hours}h {minutes}m'
+                    
+                    # Calculate time estimates
+                    elapsed_time = time.time() - start_time
+                    if completed_evaluations > 0:
+                        avg_time_per_eval = sum(evaluation_times) / len(evaluation_times) if evaluation_times else elapsed_time / completed_evaluations
+                        remaining_evals = total_batches * total_runs - completed_evaluations
+                        estimated_remaining = avg_time_per_eval * remaining_evals
+                        
+                        elapsed_str = format_time(elapsed_time)
+                        remaining_str = format_time(estimated_remaining)
+                        avg_str = format_time(avg_time_per_eval)
+                        
+                        logger.info(f'')
+                        logger.info(f'  ┌─────────────────────────────────────────────────────────────────────────┐')
+                        logger.info(f'  │ RUN {run_id}/{n_runs} - Batch {batch_num}/{total_batches} (instances {batch_start+1}-{batch_end})              │')
+                        logger.info(f'  │ Progress: Batch {batch_num}/{total_batches}, Run {run_id}/{n_runs}')
+                        logger.info(f'  │ Overall: {completed_evaluations}/{total_batches*total_runs} evaluations completed')
+                        logger.info(f'  │ Time: Elapsed {elapsed_str} | Avg {avg_str}/eval | ETA {remaining_str}')
+                        logger.info(f'  └─────────────────────────────────────────────────────────────────────────┘')
+                    else:
+                        elapsed_str = format_time(elapsed_time)
+                        logger.info(f'')
+                        logger.info(f'  ┌─────────────────────────────────────────────────────────────────────────┐')
+                        logger.info(f'  │ RUN {run_id}/{n_runs} - Batch {batch_num}/{total_batches} (instances {batch_start+1}-{batch_end})              │')
+                        logger.info(f'  │ Progress: Batch {batch_num}/{total_batches}, Run {run_id}/{n_runs}')
+                        logger.info(f'  │ Overall: {completed_evaluations}/{total_batches*total_runs} evaluations completed')
+                        logger.info(f'  │ Time: Elapsed {elapsed_str} | Calculating ETA...')
+                        logger.info(f'  └─────────────────────────────────────────────────────────────────────────┘')
                 else:
                     run_eval_note = args.eval_note
+                    logger.info(f'  Processing batch {batch_num}/{total_batches}')
                 
                 # Create metadata for this run (which will create a separate directory)
                 run_metadata = make_metadata(
@@ -905,7 +966,7 @@ if __name__ == '__main__':
                 instances = prepare_dataset(batch_instances, run_output_file, args.eval_n_limit)
                 
                 if len(instances) == 0:
-                    logger.info(f'No instances to process for run {run_id}, batch {batch_start//batch_size + 1} (all completed)')
+                    logger.info(f'  ✓ All instances in batch {batch_num}/{total_batches}, run {run_id}/{n_runs} already completed')
                     continue
                 
                 # Convert PASS_TO_PASS and FAIL_TO_PASS to strings if needed
@@ -915,18 +976,61 @@ if __name__ == '__main__':
                     for col in ['PASS_TO_PASS', 'FAIL_TO_PASS']:
                         instances[col] = instances[col].apply(lambda x: str(x))
 
+                logger.info(f'  → Evaluating {len(instances)} instances (batch {batch_num}/{total_batches}, run {run_id}/{n_runs})...')
+                
+                # Track time for this evaluation
+                eval_start_time = time.time()
+                
+                # Use the actual number of instances in the batch, capped at eval_num_workers
+                # This ensures we don't spawn more workers than needed for the last batch
+                num_workers_for_batch = min(len(instances), args.eval_num_workers)
+                
                 # Run evaluation for this batch in this run
                 run_evaluation(
                     instances,
                     run_metadata,
                     run_output_file,
-                    args.eval_num_workers,
+                    num_workers_for_batch,
                     process_instance,
                     timeout_seconds=8
                     * 60
                     * 60,  # 8 hour PER instance should be more than enough
                     max_retries=5,
                 )
+                
+                # Record evaluation time
+                eval_time = time.time() - eval_start_time
+                evaluation_times.append(eval_time)
+                # Keep only last 10 evaluations for moving average
+                if len(evaluation_times) > 10:
+                    evaluation_times.pop(0)
+                completed_evaluations += 1
+                
+                logger.info(f'  ✓ Completed run {run_id}/{n_runs} for batch {batch_num}/{total_batches}')
+        
+        # Calculate final statistics
+        total_time = time.time() - start_time
+        def format_time(seconds):
+            if seconds < 60:
+                return f'{int(seconds)}s'
+            elif seconds < 3600:
+                return f'{int(seconds // 60)}m {int(seconds % 60)}s'
+            else:
+                hours = int(seconds // 3600)
+                minutes = int((seconds % 3600) // 60)
+                return f'{hours}h {minutes}m'
+        
+        total_time_str = format_time(total_time)
+        avg_time_per_eval = total_time / completed_evaluations if completed_evaluations > 0 else 0
+        avg_time_str = format_time(avg_time_per_eval)
+        
+        logger.info('')
+        logger.info(f'╔═══════════════════════════════════════════════════════════════════════════╗')
+        logger.info(f'║ ALL EVALUATIONS COMPLETE!')
+        logger.info(f'║ Processed: {total_batches} batches × {total_runs} runs = {completed_evaluations} evaluations')
+        logger.info(f'║ Total time: {total_time_str} | Average: {avg_time_str}/evaluation')
+        logger.info(f'╚═══════════════════════════════════════════════════════════════════════════╝')
+        logger.info('')
     else:
         # ITERATIVE_EVAL_MODE - create metadata once for the entire iterative process
         metadata = make_metadata(
