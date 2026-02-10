@@ -431,6 +431,26 @@ if __name__ == '__main__':
         raise ValueError(
             'Input file must contain model_patch column OR test_result column with model_patch field.'
         )
+    
+    # Check for and remove duplicates
+    num_duplicates = len(predictions) - len(predictions['instance_id'].unique())
+    if num_duplicates > 0:
+        logger.warning(
+            f'Found {num_duplicates} duplicate instance_id(s) in input file. '
+            'Keeping only the last occurrence of each duplicate.'
+        )
+        # Find duplicates for detailed logging
+        duplicate_ids = predictions[predictions.duplicated(subset=['instance_id'], keep='last')]['instance_id'].tolist()
+        if len(duplicate_ids) <= 10:
+            logger.warning(f'Duplicate instance_ids: {duplicate_ids}')
+        else:
+            logger.warning(f'Duplicate instance_ids (first 10): {duplicate_ids[:10]}...')
+        
+        # Keep only the last occurrence of each duplicate
+        predictions = predictions.drop_duplicates(subset=['instance_id'], keep='last')
+        predictions = predictions.reset_index(drop=True)
+        logger.info(f'After deduplication: {len(predictions)} unique instances')
+    
     assert len(predictions['instance_id'].unique()) == len(predictions), (
         'instance_id column must be unique.'
     )

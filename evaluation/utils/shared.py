@@ -232,9 +232,22 @@ def prepare_dataset(
     finished_ids: set[str] = set()
     if os.path.exists(output_file):
         with open(output_file, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                finished_ids.add(str(data[id_column]))
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    # Skip empty lines - they will be reprocessed
+                    continue
+                try:
+                    data = json.loads(line)
+                    finished_ids.add(str(data[id_column]))
+                except json.JSONDecodeError as e:
+                    # Corrupted JSON line - will be reprocessed
+                    logger.warning(
+                        f'Found corrupted JSON on line {line_num} in {output_file}: {e}'
+                    )
+                    logger.warning(f'Corrupted line content: {line[:200]}...')
+                    logger.warning('This instance will be reprocessed.')
+                    continue
         logger.warning(
             f'\nOutput file {output_file} already exists. Loaded {len(finished_ids)} finished instances.'
         )
@@ -513,6 +526,14 @@ def run_evaluation(
         logger.info(f'Evaluation started with {num_workers} workers.')
 
     total_instances = len(dataset)
+    
+    # Early exit if no instances to process
+    if total_instances == 0:
+        logger.info('No instances to process. Evaluation complete.')
+        if metadata and metadata.eval_output_dir:
+            check_maximum_retries_exceeded(metadata.eval_output_dir)
+        return
+    
     pbar = tqdm(total=total_instances, desc='Instances processed')
     output_fp = open(output_file, 'a')
 

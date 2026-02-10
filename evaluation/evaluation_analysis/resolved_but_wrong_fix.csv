@@ -1,0 +1,3 @@
+instance_id,resolved,has_error,error_type,outcome_status,final_test_state,alignment_score,accidental_pass_risk,num_missing_requirements,num_extra_behaviors,failure_class,failure_inferability,failure_reason_code,failure_stage,spec_alignment,repo_exploration,root_cause_quality,patch_correctness,validation_rigor,iteration_efficiency
+django__django-11999,True,False,,wrong_fix,some_fail,1.0,low,1.0,0.0,internal,inferable_from_golden,INT_FIX_STRATEGY_WRONG_LEVEL,implementation,1.0,3.0,2.0,1.0,4.0,2.0
+django__django-12155,True,False,,wrong_fix,some_fail,1.0,low,2.0,0.0,internal,inferable_from_golden,INT_IMPL_LOGIC_BUG,implementation,1.0,3.0,2.0,1.0,3.0,1.0

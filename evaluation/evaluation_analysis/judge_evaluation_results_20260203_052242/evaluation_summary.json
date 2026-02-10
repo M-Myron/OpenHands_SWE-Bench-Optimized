@@ -1,0 +1,18 @@
+{
+  "total_evaluated": 10,
+  "llm_stats": {
+    "total_calls": 10,
+    "failed_calls": 0,
+    "total_tokens": 646530
+  },
+  "outcome_distribution": {
+    "true_pass": 7,
+    "wrong_fix": 3
+  },
+  "failure_class_distribution": {
+    "none": 7,
+    "internal": 3
+  },
+  "avg_alignment_score": 3.3,
+  "errors": []
+}

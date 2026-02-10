@@ -1,0 +1,29 @@
+{
+  "total_evaluated": 100,
+  "llm_stats": {
+    "total_calls": 99,
+    "failed_calls": 5,
+    "total_tokens": 5369050
+  },
+  "outcome_distribution": {
+    "true_pass": 66,
+    "wrong_fix": 22,
+    "inconclusive": 5,
+    "partial_fix": 5
+  },
+  "failure_class_distribution": {
+    "none": 65,
+    "internal": 33
+  },
+  "avg_alignment_score": 3.1530612244897958,
+  "errors": [
+    {
+      "instance_id": "django__django-10097",
+      "error": "JSON extraction failed"
+    },
+    {
+      "instance_id": "django__django-12050",
+      "error": "LLM call failed"
+    }
+  ]
+}
