@@ -37,6 +37,15 @@ def get_blob_images_subdir() -> str:
     return os.environ.get('BLOB_IMAGES_SUBDIR', 'images')
 
 
+def get_blob_load_timeout() -> int:
+    """Get the timeout for loading Docker images from blob storage.
+
+    Returns:
+        int: Timeout in seconds, defaults to 600 (10 minutes).
+    """
+    return int(os.environ.get('BLOB_LOAD_TIMEOUT', '1200'))
+
+
 def is_blob_image_loading_enabled() -> bool:
     """Check if blob image loading is enabled.
 
@@ -163,7 +172,7 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
             shell=True,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 minute timeout for large images
+            timeout=get_blob_load_timeout(),
         )
 
         if result.returncode != 0:
@@ -187,8 +196,9 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
         return True, local_temp_path
 
     except subprocess.TimeoutExpired:
+        timeout_seconds = get_blob_load_timeout()
         logger.error(
-            f'Timeout while loading image from tarball (>10 minutes): {image_name}'
+            f'Timeout while loading image from tarball (>{timeout_seconds} seconds): {image_name}'
         )
         # Clean up on timeout
         if local_temp_path and os.path.exists(local_temp_path):
