@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from openhands.core.logger import openhands_logger as logger
@@ -138,12 +139,26 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
             - success: True if image was successfully loaded
             - local_tarball_path: Path to the local tarball copy (for cleanup), or None if failed
     """
+    overall_start = time.time()
+    
     # remove docker.io prefix if present
     if image_name.startswith('docker.io/'):
         image_name = image_name[len('docker.io/'):]
+    
+    # Step 1: Find tarball
+    find_start = time.time()
     tarball_path = find_blob_image_tarball(image_name)
     if not tarball_path:
         return False, None
+    find_elapsed = time.time() - find_start
+    logger.info(f'⏱️ Step 1/3: Found tarball in {find_elapsed:.2f}s')
+
+    # Get tarball size for logging
+    try:
+        tarball_size_mb = os.path.getsize(tarball_path) / (1024 * 1024)
+        logger.info(f'📦 Tarball size: {tarball_size_mb:.2f} MB')
+    except Exception:
+        tarball_size_mb = 0
 
     # Create process-specific temp directory
     local_temp_dir = get_process_temp_dir()
@@ -152,21 +167,35 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
     try:
         os.makedirs(local_temp_dir, exist_ok=True)
 
-        # Copy tarball to local disk for faster loading
+        # Step 2: Copy tarball to local disk
         tarball_name = os.path.basename(tarball_path)
         local_temp_path = os.path.join(local_temp_dir, tarball_name)
 
         logger.info(
-            f'Copying prebuilt image tarball from blob to local disk: '
-            f'{tarball_path} -> {local_temp_path}'
+            f'⏱️ Step 2/3: Copying prebuilt image tarball from blob to local disk...'
         )
+        logger.info(f'  Source: {tarball_path}')
+        logger.info(f'  Dest:   {local_temp_path}')
+        
+        copy_start = time.time()
         shutil.copy2(tarball_path, local_temp_path)
+        copy_elapsed = time.time() - copy_start
+        
+        if tarball_size_mb > 0:
+            copy_speed = tarball_size_mb / copy_elapsed
+            logger.info(f'✅ Copy completed in {copy_elapsed:.2f}s ({copy_speed:.2f} MB/s)')
+        else:
+            logger.info(f'✅ Copy completed in {copy_elapsed:.2f}s')
 
-        # Load the image into Docker
-        logger.info(f'Loading Docker image from tarball: {image_name}')
+        # Step 3: Load the image into Docker
+        logger.info(f'⏱️ Step 3/3: Loading Docker image from tarball...')
+        logger.info(f'  Image: {image_name}')
+        logger.info(f'  Timeout: {get_blob_load_timeout()}s')
 
         # Use gzip -dc to decompress and pipe to docker load
         cmd = f'gzip -dc "{local_temp_path}" | docker load'
+        
+        load_start = time.time()
         result = subprocess.run(
             cmd,
             shell=True,
@@ -174,10 +203,11 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
             text=True,
             timeout=get_blob_load_timeout(),
         )
+        load_elapsed = time.time() - load_start
 
         if result.returncode != 0:
             logger.error(
-                f'Failed to load image from tarball: {result.stderr}'
+                f'❌ Failed to load image from tarball after {load_elapsed:.2f}s: {result.stderr}'
             )
             # Clean up failed copy
             if os.path.exists(local_temp_path):
@@ -187,8 +217,15 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
                     pass
             return False, None
 
+        overall_elapsed = time.time() - overall_start
+        logger.info(f'✅ Docker load completed in {load_elapsed:.2f}s')
         logger.info(
-            f'✅ Successfully loaded prebuilt image from blob storage: {image_name}'
+            f'🎉 Successfully loaded prebuilt image from blob storage: {image_name}'
+        )
+        logger.info(
+            f'📊 Total time breakdown: Find={find_elapsed:.2f}s, '
+            f'Copy={copy_elapsed:.2f}s, Load={load_elapsed:.2f}s, '
+            f'Total={overall_elapsed:.2f}s'
         )
         logger.debug(f'Docker load output: {result.stdout}')
 
@@ -197,8 +234,14 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
 
     except subprocess.TimeoutExpired:
         timeout_seconds = get_blob_load_timeout()
+        elapsed = time.time() - overall_start
         logger.error(
-            f'Timeout while loading image from tarball (>{timeout_seconds} seconds): {image_name}'
+            f'⏰ TIMEOUT while loading image from tarball after {elapsed:.2f}s '
+            f'(limit: {timeout_seconds}s): {image_name}'
+        )
+        logger.error(
+            f'💡 Timeout occurred during docker load step. '
+            f'Consider increasing BLOB_LOAD_TIMEOUT or checking Docker daemon performance.'
         )
         # Clean up on timeout
         if local_temp_path and os.path.exists(local_temp_path):
@@ -208,8 +251,9 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
                 pass
         return False, None
     except Exception as e:
+        elapsed = time.time() - overall_start
         logger.error(
-            f'Error loading image from blob storage: {e}'
+            f'❌ Error loading image from blob storage after {elapsed:.2f}s: {e}'
         )
         # Clean up on error
         if local_temp_path and os.path.exists(local_temp_path):
