@@ -15,9 +15,15 @@ import shutil
 import subprocess
 import tempfile
 import time
+import threading
 from pathlib import Path
 
 from openhands.core.logger import openhands_logger as logger
+
+# Global semaphore to limit concurrent docker load operations
+# This prevents Docker daemon overload when many workers try to load simultaneously
+_MAX_CONCURRENT_LOADS = int(os.environ.get('BLOB_MAX_CONCURRENT_LOADS', '4'))
+_docker_load_semaphore = threading.Semaphore(_MAX_CONCURRENT_LOADS)
 
 
 def get_blob_mount_dir() -> str | None:
@@ -192,6 +198,7 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
         logger.info(f'  Image: {image_name}')
         logger.info(f'  Timeout: {get_blob_load_timeout()}s')
         logger.info(f'  Command: gzip -dc | docker load')
+        logger.info(f'  Max concurrent loads: {_MAX_CONCURRENT_LOADS}')
 
         # Check Docker daemon status before loading
         try:
@@ -206,20 +213,33 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
         except Exception as e:
             logger.warning(f'  Could not check Docker status: {e}')
 
-        # Use gzip -dc to decompress and pipe to docker load
-        cmd = f'gzip -dc "{local_temp_path}" | docker load'
+        # Acquire semaphore to limit concurrent docker loads
+        semaphore_wait_start = time.time()
+        logger.info('  ⏳ Waiting for docker load slot (concurrency limit)...')
+        _docker_load_semaphore.acquire()
+        semaphore_wait_time = time.time() - semaphore_wait_start
+        if semaphore_wait_time > 1:
+            logger.info(f'  ✅ Acquired docker load slot after {semaphore_wait_time:.2f}s wait')
         
-        load_start = time.time()
-        logger.info(f'  ⏰ Starting docker load at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(load_start))}')
-        
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=get_blob_load_timeout(),
-        )
-        load_elapsed = time.time() - load_start
+        try:
+            # Use gzip -dc to decompress and pipe to docker load
+            cmd = f'gzip -dc "{local_temp_path}" | docker load'
+            
+            load_start = time.time()
+            logger.info(f'  ⏰ Starting docker load at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(load_start))}')
+            
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=get_blob_load_timeout(),
+            )
+            load_elapsed = time.time() - load_start
+        finally:
+            # Always release the semaphore
+            _docker_load_semaphore.release()
+            logger.debug('  Released docker load slot')
 
         if result.returncode != 0:
             logger.error(

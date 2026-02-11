@@ -109,14 +109,15 @@ function run_eval() {
   # Start periodic Docker cleanup in background
   (
     while true; do
-      sleep 1800  # Every 30 minutes (more frequent)
+      sleep 3600  # Every 60 minutes (less frequent to avoid interference)
       echo "Running periodic Docker cleanup..."
-      # Remove stopped containers
+      # Remove stopped containers only
       docker container prune -f 2>/dev/null || true
-      # Remove ALL unused images older than 30 minutes (much more aggressive)
-      docker image prune -a -f --filter "until=30m" 2>/dev/null || true
-      # Also remove build cache to free up space
-      docker builder prune -f --filter "until=30m" 2>/dev/null || true
+      # DO NOT prune images during active runs - causes Docker daemon locks
+      # Only prune dangling images (not used by any container)
+      docker image prune -f 2>/dev/null || true
+      # Prune build cache only
+      docker builder prune -f --filter "until=1h" 2>/dev/null || true
       # Show current usage
       echo "Current Docker usage:"
       docker system df
