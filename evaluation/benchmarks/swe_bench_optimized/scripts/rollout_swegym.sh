@@ -17,8 +17,60 @@ export ITERATIVE_EVAL_MODE=false
 # Skip instances that reach maximum retries instead of crashing the entire evaluation
 # Failed instances will be logged to maximum_retries_exceeded.jsonl
 export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
+
+echo "=============================================================="
+echo "SWE-Gym Rollout Configuration"
+echo "=============================================================="
 echo "MODEL: $MODEL"
 echo "EXP_NAME: $EXP_NAME"
+echo "N_WORKERS: $N_WORKERS"
+echo "N_RUNS: $N_RUNS"
+echo ""
+
+# Pre-flight Docker check
+echo "=== Pre-flight Docker Check ==="
+DOCKER_PS_TIME=$(date +%s.%N)
+docker ps > /dev/null 2>&1
+DOCKER_PS_ELAPSED=$(awk "BEGIN {printf \"%.2f\", $(date +%s.%N) - $DOCKER_PS_TIME}")
+echo "Docker daemon response time: ${DOCKER_PS_ELAPSED}s"
+
+if (( $(echo "$DOCKER_PS_ELAPSED > 2.0" | bc -l) )); then
+    echo "⚠️  WARNING: Docker daemon is slow to respond (>${DOCKER_PS_ELAPSED}s)"
+    echo "   This may cause issues during evaluation"
+fi
+
+INITIAL_CONTAINERS=$(docker ps -q | wc -l)
+INITIAL_IMAGES=$(docker images -q | wc -l)
+echo "Initial state: $INITIAL_CONTAINERS containers, $INITIAL_IMAGES images"
+
+# Check blob loading configuration if enabled
+if [ -n "$BLOB_MOUNT_DIR" ]; then
+    echo ""
+    echo "=== Blob Image Loading Configuration ==="
+    echo "BLOB_MOUNT_DIR: $BLOB_MOUNT_DIR"
+    echo "BLOB_IMAGES_SUBDIR: ${BLOB_IMAGES_SUBDIR:-images}"
+    echo "BLOB_LOAD_TIMEOUT: ${BLOB_LOAD_TIMEOUT:-1200}s"
+    
+    if [ -d "$BLOB_MOUNT_DIR" ]; then
+        echo "✅ Blob mount directory exists"
+        IMAGES_DIR="$BLOB_MOUNT_DIR/${BLOB_IMAGES_SUBDIR:-images}"
+        if [ -d "$IMAGES_DIR" ]; then
+            IMAGE_COUNT=$(find "$IMAGES_DIR" -name "*.tar.gz" 2>/dev/null | wc -l)
+            echo "✅ Found $IMAGE_COUNT prebuilt images in blob storage"
+        else
+            echo "⚠️  WARNING: Images directory not found: $IMAGES_DIR"
+        fi
+    else
+        echo "❌ ERROR: Blob mount directory not found: $BLOB_MOUNT_DIR"
+    fi
+fi
+
+echo ""
+echo "Docker disk usage:"
+docker system df
+echo "=============================================================="
+echo ""
+
 DATASET="SWE-Gym/SWE-Gym"  # change this to the "/SWE-Gym-Lite" if you want to rollout the lite subset
 SPLIT="train"
 
@@ -55,6 +107,52 @@ EVAL_NOTE="$OPENHANDS_VERSION-no-hint-$EXP_NAME"
 function run_eval() {
   local eval_note=$1
   local n_runs=$2
+  
+  # Start monitoring in background
+  MONITOR_LOG="evaluation/evaluation_outputs/docker_monitor_$(date +%Y%m%d_%H%M%S).log"
+  mkdir -p "$(dirname "$MONITOR_LOG")"
+  echo "Starting Docker monitoring - logs: $MONITOR_LOG"
+  
+  (
+    while true; do
+      {
+        echo "=== Docker Monitor - $(date '+%Y-%m-%d %H:%M:%S') ==="
+        
+        # Count docker load processes
+        LOAD_COUNT=$(ps aux | grep -E "docker load|gzip.*docker" | grep -v grep | wc -l)
+        echo "Active 'docker load' processes: $LOAD_COUNT"
+        
+        if [ $LOAD_COUNT -gt 0 ]; then
+          echo "Process details:"
+          ps aux | grep -E "docker load|gzip.*docker" | grep -v grep | awk '{printf "  PID: %-7s CPU: %-5s MEM: %-5s TIME: %-10s\n", $2, $3"%", $4"%", $10}' | head -10
+          if [ $LOAD_COUNT -gt 10 ]; then
+            echo "  ... and $((LOAD_COUNT - 10)) more"
+          fi
+        fi
+        
+        # Docker stats
+        CONTAINERS=$(docker ps -q 2>/dev/null | wc -l)
+        IMAGES=$(docker images -q 2>/dev/null | wc -l)
+        echo "Docker: $CONTAINERS containers, $IMAGES images"
+        
+        # System resources
+        echo "CPU load: $(uptime | awk -F'load average:' '{print $2}')"
+        echo "Memory: $(free -h | grep Mem | awk '{print $3 "/" $2 " (" $3/$2*100 "%)"}')"
+        
+        # Docker disk usage
+        echo "Docker disk usage:"
+        docker system df --format "  {{.Type}}: {{.Size}} ({{.Reclaimable}} reclaimable)" 2>/dev/null || echo "  Unable to get disk usage"
+        
+        echo "---"
+      } >> "$MONITOR_LOG" 2>&1
+      sleep 30  # Update every 30 seconds
+    done
+  ) &
+  MONITOR_PID=$!
+  echo "Docker monitor started with PID: $MONITOR_PID"
+  
+  # Set up trap to kill monitor process on script exit or interruption
+  trap "kill $MONITOR_PID 2>/dev/null || true; echo 'Docker monitor stopped'" EXIT INT TERM
   
   # Start periodic Docker cleanup in background (only for local docker runtime)
   if [ "$RUNTIME" = "docker" ]; then
@@ -120,6 +218,10 @@ function run_eval() {
     kill $CLEANUP_PID 2>/dev/null || true
     trap - EXIT INT TERM  # Remove trap after cleanup
   fi
+  
+  # Kill the monitor background process
+  kill $MONITOR_PID 2>/dev/null || true
+  echo "Docker monitoring stopped. Logs saved to: $MONITOR_LOG"
 }
 
 # ============================================================
@@ -265,3 +367,26 @@ echo ""
 echo "=============================================================="
 echo "ALL $N_RUNS RUNS COMPLETED!"
 echo "=============================================================="
+
+# Show monitoring summary if available
+if [ -f "$MONITOR_LOG" ]; then
+    echo ""
+    echo "=== Docker Monitoring Summary ==="
+    echo "Full monitoring log: $MONITOR_LOG"
+    
+    # Peak docker load processes
+    PEAK_LOADS=$(grep "Active 'docker load' processes:" "$MONITOR_LOG" | awk '{print $5}' | sort -rn | head -1)
+    echo "Peak concurrent docker load processes: $PEAK_LOADS"
+    
+    # Peak containers
+    PEAK_CONTAINERS=$(grep "Docker:" "$MONITOR_LOG" | awk '{print $2}' | sort -rn | head -1)
+    echo "Peak running containers: $PEAK_CONTAINERS"
+    
+    # Peak images
+    PEAK_IMAGES=$(grep "Docker:" "$MONITOR_LOG" | awk '{print $4}' | sort -rn | head -1)
+    echo "Peak Docker images: $PEAK_IMAGES"
+    
+    echo ""
+    echo "Last 5 monitoring snapshots:"
+    grep -A 10 "=== Docker Monitor" "$MONITOR_LOG" | tail -55
+fi

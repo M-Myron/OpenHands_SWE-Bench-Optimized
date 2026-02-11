@@ -191,11 +191,27 @@ def load_image_from_blob(image_name: str) -> tuple[bool, str | None]:
         logger.info(f'⏱️ Step 3/3: Loading Docker image from tarball...')
         logger.info(f'  Image: {image_name}')
         logger.info(f'  Timeout: {get_blob_load_timeout()}s')
+        logger.info(f'  Command: gzip -dc | docker load')
+
+        # Check Docker daemon status before loading
+        try:
+            docker_ps_result = subprocess.run(
+                ['docker', 'ps', '-q'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            running_containers = len(docker_ps_result.stdout.strip().split('\n')) if docker_ps_result.stdout.strip() else 0
+            logger.info(f'  Docker status: {running_containers} running containers')
+        except Exception as e:
+            logger.warning(f'  Could not check Docker status: {e}')
 
         # Use gzip -dc to decompress and pipe to docker load
         cmd = f'gzip -dc "{local_temp_path}" | docker load'
         
         load_start = time.time()
+        logger.info(f'  ⏰ Starting docker load at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(load_start))}')
+        
         result = subprocess.run(
             cmd,
             shell=True,
