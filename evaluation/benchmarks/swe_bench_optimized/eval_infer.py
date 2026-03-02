@@ -296,6 +296,16 @@ def process_instance(
                         os.makedirs(log_dir, exist_ok=True)
                         test_output_path = os.path.join(log_dir, 'test_output.txt')
                         with open(test_output_path, 'w') as f:
+                            if 'SWE-Gym' in metadata.dataset:
+                                # The SWE-Gym grader (get_logs_eval) requires "applied patch"
+                                # and ">>>>> Applied Patch (pred)" markers in the test log.
+                                # OpenHands applies the patch separately (not inside eval.sh),
+                                # so we prepend the apply_patch_output and the required marker
+                                # so the grader can find them.
+                                f.write(apply_patch_output + '\n')
+                                f.write(
+                                    f'{conditional_imports.APPLY_PATCH_PASS} (pred)\n'
+                                )
                             f.write(test_output)
                         try:
                             extra_kwargs = {}
