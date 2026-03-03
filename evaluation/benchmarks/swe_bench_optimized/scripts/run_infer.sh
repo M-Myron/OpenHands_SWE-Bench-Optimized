@@ -13,6 +13,8 @@ DATASET=$7
 SPLIT=$8
 N_RUNS=$9
 MODE=${10}
+# Optional: override output directory via 11th arg or EVAL_OUTPUT_DIR env var
+EVAL_OUTPUT_DIR=${11:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs"}}
 
 
 if [ -z "$NUM_WORKERS" ]; then
@@ -74,6 +76,7 @@ echo "NUM_WORKERS: $NUM_WORKERS"
 echo "COMMIT_HASH: $COMMIT_HASH"
 echo "MODE: $MODE"
 echo "EVAL_CONDENSER: $EVAL_CONDENSER"
+echo "EVAL_OUTPUT_DIR: $EVAL_OUTPUT_DIR"
 
 # Default to NOT use Hint
 if [ -z "$USE_HINT_TEXT" ]; then
@@ -135,6 +138,7 @@ function run_eval() {
     --max-iterations $MAX_ITER \
     --eval-num-workers $NUM_WORKERS \
     --eval-note $eval_note \
+    --eval-output-dir $EVAL_OUTPUT_DIR \
     --dataset $DATASET \
     --split $SPLIT \
     --mode $MODE \

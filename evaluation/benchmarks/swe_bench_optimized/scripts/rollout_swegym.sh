@@ -9,6 +9,8 @@ MODEL=$1  # eg your llm config name in config.toml (eg: "llm.claude-3-5-sonnet-2
 EXP_NAME=$2 # "train-t05"
 N_WORKERS=${3:-64}
 N_RUNS=${4:-1}
+# Optional: override output directory via 5th arg or EVAL_OUTPUT_DIR env var
+EVAL_OUTPUT_DIR=${5:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs"}}
 
 export EXP_NAME=$EXP_NAME
 # use 2x resources for rollout since some codebases are pretty resource-intensive
@@ -88,6 +90,7 @@ function run_eval() {
     --max-iterations $MAX_ITER \
     --eval-num-workers $N_WORKERS \
     --eval-note $eval_note \
+    --eval-output-dir $EVAL_OUTPUT_DIR \
     --dataset $DATASET \
     --split $SPLIT \
     --n-runs $n_runs"
