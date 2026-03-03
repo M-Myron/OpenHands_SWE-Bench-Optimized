@@ -9,6 +9,8 @@ MODEL=$1  # eg your llm config name in config.toml (eg: "llm.claude-3-5-sonnet-2
 EXP_NAME=$2 # "train-t05"
 N_WORKERS=${3:-64}
 N_RUNS=${4:-1}
+# Optional: override output directory via 5th arg or EVAL_OUTPUT_DIR env var
+EVAL_OUTPUT_DIR=${5:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs"}}
 
 export EXP_NAME=$EXP_NAME
 # use 2x resources for rollout since some codebases are pretty resource-intensive
@@ -157,22 +159,22 @@ function run_eval() {
   # Start periodic Docker cleanup in background (only for local docker runtime)
   if [ "$RUNTIME" = "docker" ]; then
     (
-    #   while true; do
-    #     sleep 1800  # Every 30 minutes
-    #     echo "### Running periodic Docker cleanup during evaluation... ###"
-    #     # Remove stopped containers
-    #     docker ps -q --filter "name=openhands-runtime-" --filter "status=exited" | xargs -r docker rm 2>/dev/null || true
-    #     # Remove SWE-bench evaluation images
-    #     docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
-    #     # Prune dangling images and build cache
-    #     docker image prune -f 2>/dev/null || true
-    #     docker builder prune -f --filter "until=30m" 2>/dev/null || true
-    #     # Show current usage
-    #     echo "Current Docker usage:"
-    #     docker system df
-    #     echo "Running containers: $(docker ps -q | wc -l)"
-    #     echo "Total images: $(docker images -q | wc -l)"
-    #   done
+      while true; do
+        sleep 1800  # Every 30 minutes
+        echo "### Running periodic Docker cleanup during evaluation... ###"
+        # Remove stopped containers
+        docker ps -q --filter "name=openhands-runtime-" --filter "status=exited" | xargs -r docker rm 2>/dev/null || true
+        # Remove SWE-bench evaluation images
+        docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
+        # Prune dangling images and build cache
+        docker image prune -f 2>/dev/null || true
+        docker builder prune -f --filter "until=30m" 2>/dev/null || true
+        # Show current usage
+        echo "Current Docker usage:"
+        docker system df
+        echo "Running containers: $(docker ps -q | wc -l)"
+        echo "Total images: $(docker images -q | wc -l)"
+      done
     while true; do
         sleep 1800  # Every 30 minutes (more frequent)
         echo "Running periodic Docker cleanup..."
@@ -201,6 +203,7 @@ function run_eval() {
     --max-iterations $MAX_ITER \
     --eval-num-workers $N_WORKERS \
     --eval-note $eval_note \
+    --eval-output-dir $EVAL_OUTPUT_DIR \
     --dataset $DATASET \
     --split $SPLIT \
     --n-runs $n_runs"
