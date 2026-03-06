@@ -1,0 +1,112 @@
+<uploaded_files>
+/workspace/{{ workspace_dir_name }}
+</uploaded_files>
+
+I've uploaded a python code repository in the directory {{ workspace_dir_name }}. Consider the following issue description:
+
+<issue_description>
+{{ instance.problem_statement }}
+</issue_description>
+
+Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?
+I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
+Also the development Python environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.
+Your task is to make the minimal changes to non-test files in the /workspace/{{ workspace_dir_name }} directory to ensure the <issue_description> is satisfied.
+
+<REFERENCE_INFORMATION>
+The following verified patch and test are provided so you know exactly where this task ends up. Your job is **not** to reproduce the patch mechanically — it is to produce a realistic, step-by-step trajectory that a skilled engineer would follow if they had to discover and fix this bug from scratch, starting only from the issue description above.
+
+## YOUR GOAL: A REACHABLE TRAJECTORY
+
+Every single step you take must be reachable from your accumulated interaction history. That means:
+
+- Every file path, function name, variable name, or code value you mention in your reasoning must have appeared in a prior tool call output — OR must be explicitly named in the issue description above.
+- Every conclusion ("the bug is here", "the fix is this") must cite specific evidence from your own tool call observations.
+- You must actually run the exploration steps (read files, run commands, search with grep) rather than skipping them because you already know the answer.
+
+Think of it this way: **you are producing training data for a future agent that will NOT have the reference.** That future agent must be able to follow your trajectory step by step and arrive at the same fix purely from what your tool calls revealed. If any step in your trajectory requires knowledge the future agent couldn't have had yet, that step is invalid.
+
+## RULES — A SECOND REVIEWER IS WATCHING
+
+An independent reviewer validates every step. They do NOT see the reference patch or test. They only see the issue description, your accumulated history, and your current response. They will reject your step if you mention or rely on anything that isn't derivable from those three sources.
+
+**ALLOWED:**
+- Using names (classes, functions, error messages) that appear verbatim in the issue description above — the issue is public knowledge
+- Navigating directly to the relevant file/module based on your knowledge of the codebase structure, then reading it with a tool call to produce the evidence
+- Reproducing the failing behaviour by running the test case described in the issue
+- Reasoning from what your tool calls actually returned
+
+**FORBIDDEN:**
+- Referencing the patch or test explicitly (do not write "the reference patch", "the patch says", "according to the reference", "as specified in the patch", "the golden patch")
+- Stating any specific code value, variable name, exact line number, or diff hunk that you have not yet observed through a tool call
+- Writing a reproduction script that uses exact import paths, exact variable names, or exact code patterns from the patch before you have read the relevant source file
+- Claiming to have "found" the bug or fix before you have actually read the relevant source code with a tool call
+- Skipping the exploration phases because you already know the answer
+
+**HOW TO PRODUCE A VALID STEP:**
+1. In your thought, state what you observed so far and what you want to find out next — cite only what your tool calls have already returned.
+2. Issue a single, focused tool call (read a file, run a command, search with grep).
+3. In the next step, reason from what that tool call returned, not from prior knowledge.
+4. When you state a fix, every detail (file path, line number, old value, new value) must have appeared in your own tool output.
+
+## Reference Patch
+
+```diff
+{{ instance.patch }}
+```
+
+## Reference Test
+
+```python
+{{ instance.test_patch }}
+```
+</REFERENCE_INFORMATION>
+
+Follow these phases to resolve the issue:
+
+Phase 1. READING: read the problem and reword it in clearer terms
+   1.1 If there are code or config snippets. Express in words any best practices or conventions in them.
+   1.2 Highlight message errors, method names, variables, file names, stack traces, and technical details.
+   1.3 Explain the problem in clear terms.
+   1.4 Enumerate the steps to reproduce the problem.
+   1.5 Highlight any best practices to take into account when testing and fixing the issue
+
+Phase 2. RUNNING: install and run the tests on the repository
+   2.1 Follow the readme
+   2.2 Install the environment and anything needed
+   2.2 Iterate and figure out how to run the tests
+
+Phase 3. EXPLORATION: find the files that are related to the problem and possible solutions
+   3.1 Use `grep` to search for relevant methods, classes, keywords and error messages.
+   3.2 Identify all files related to the problem statement.
+   3.3 Propose the methods and files to fix the issue and explain why.
+   3.4 From the possible file locations, select the most likely location to fix the issue.
+
+Phase 4. TEST CREATION: before implementing any fix, create a script to reproduce and verify the issue.
+   4.1 Look at existing test files in the repository to understand the test format/structure.
+   4.2 Create a minimal reproduction script that reproduces the located issue.
+   4.3 Run the reproduction script to confirm you are reproducing the issue.
+   4.4 Adjust the reproduction script as necessary.
+
+Phase 5. FIX ANALYSIS: state clearly the problem and how to fix it
+   5.1 State clearly what the problem is.
+   5.2 State clearly where the problem is located.
+   5.3 State clearly how the test reproduces the issue.
+   5.4 State clearly the best practices to take into account in the fix.
+   5.5 State clearly how to fix the problem.
+
+Phase 6. FIX IMPLEMENTATION: Edit the source code to implement your chosen solution.
+   6.1 Make minimal, focused changes to fix the issue.
+
+Phase 7. VERIFICATION: Test your implementation thoroughly.
+   7.1 Run your reproduction script to verify the fix works.
+   7.2 Add edge cases to your test script to ensure comprehensive coverage.
+   7.3 Run existing tests related to the modified code to ensure you haven't broken anything.
+
+8. FINAL REVIEW: Carefully re-read the problem description and compare your changes with the base commit {{ instance.base_commit }}.
+   8.1 Ensure you've fully addressed all requirements.
+   8.2 Run any tests in the repository related to:
+     8.2.1 The issue you are fixing
+     8.2.2 Any related functionality
+
+Be thorough in your exploration, reasoning, and testing. Your goal is a complete and correct solution.
