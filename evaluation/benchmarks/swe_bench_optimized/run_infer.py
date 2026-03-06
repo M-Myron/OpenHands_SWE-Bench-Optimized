@@ -433,6 +433,73 @@ def initialize_runtime(
             f'Expected to find python interpreter from testbed, but got: {str(obs)}',
         )
 
+        # Redirect the testbed editable install to /workspace so agent edits are visible
+        # to the test runner.  Three layers are applied in order:
+        #
+        # LAYER 1 – pip install -e . --no-deps
+        #   Works for all pure-Python packages (django, flask, requests, sympy, …).
+        #   Correctly updates pip's own package registry to point to /workspace.
+        #   May fail silently for packages with C extensions (scikit-learn, matplotlib)
+        #   because the testbed conda env's build tools (Cython, gcc) are not guaranteed
+        #   to be available at evaluation time.  The || true prevents aborting in that case.
+        action = CmdRunAction(
+            command=f'cd /workspace/{workspace_dir_name} && pip install -e . --no-deps -q 2>&1 || true'
+        )
+        action.set_hard_timeout(300)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+        # LAYER 2 – Direct sed-patch of editable-install metadata files in site-packages.
+        #   Catches everything that Layer 1 misses:
+        #     • C-extension packages (sklearn, matplotlib) where pip install -e fails
+        #     • Legacy 'python setup.py develop' installs (writes .egg-link + easy-install.pth)
+        #     • Any older pip version that left stale /testbed entries alongside new ones
+        #   Files targeted: *.egg-link, easy-install.pth, __editable__*.pth
+        #   Safety: /workspace/$name is an exact 'cp -r /testbed' copy — all compiled .so
+        #   files and directory structure are identical, so path-pointer redirection is safe
+        #   without any recompilation.
+        #   The SITE variable is computed dynamically so this works for both
+        #   /opt/miniconda3/envs/testbed (standard SWE-bench) and
+        #   /opt/conda/envs/testbed (SWE-rebench) without hardcoding paths.
+        action = CmdRunAction(
+            command=(
+                f'SITE=$(python -c "import site; print(site.getsitepackages()[0])") 2>/dev/null '
+                f'&& find "$SITE" \\( -name "*.egg-link" -o -name "easy-install.pth" '
+                f'-o -name "__editable__*.pth" \\) '
+                f'-exec grep -l "/testbed" {{}} \\; 2>/dev/null '
+                f'| while read f; do '
+                f'  sed -i "s|/testbed|/workspace/{workspace_dir_name}|g" "$f" '
+                f'  && echo "Patched editable-install metadata: $f"; '
+                f'done || true'
+            )
+        )
+        action.set_hard_timeout(60)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+        # LAYER 3 – Verification: log which sys.path entries still reference /testbed vs
+        #   /workspace.  A clean state shows ONLY /workspace entries.  If /testbed still
+        #   appears here both layers failed (unlikely), which is useful for future debugging.
+        action = CmdRunAction(
+            command=(
+                "python -c \""
+                "import sys; "
+                "bad=[p for p in sys.path if '/testbed' in p]; "
+                "good=[p for p in sys.path if '/workspace' in p]; "
+                "print('testbed_in_syspath:', bad); "
+                "print('workspace_in_syspath:', good)\""
+            )
+        )
+        action.set_hard_timeout(30)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        logger.info(
+            f'Import-path redirection status (exit_code={obs.exit_code}):\n{obs.content}'
+        )
+
     logger.info('-' * 30)
     logger.info('END Runtime Initialization Fn')
     logger.info('-' * 30)
