@@ -237,6 +237,13 @@ def build_runtime_image_in_folder(
             )
             return lock_image_name
         else:
+            simple_tag = base_image.replace('/', '_').replace(':', '_')
+            simple_image_name = f'{runtime_image_repo}:{simple_tag}'
+            if runtime_builder.image_exists(simple_image_name, pull_from_repo=True):
+                logger.info(
+                    f'✅ Successfully pulled prebuilt base image from registry: [{simple_image_name}]'
+                )
+                return simple_image_name
             logger.info(
                 f'Image [{hash_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
             )
