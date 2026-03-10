@@ -67,19 +67,37 @@ from openhands.utils.async_utils import call_async_from_sync
 # ──────────────────────────────────────────────────────────────────────────────
 
 DOCKER_IMAGE_PREFIX = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/')
-logger.info(f'Using docker image prefix: {DOCKER_IMAGE_PREFIX}')
+logger.info(f'Using docker image prefix (SWE-Gym): {DOCKER_IMAGE_PREFIX}')
+
+# Official SWE-bench base images live under docker.io/swebench/
+SWEBENCH_DOCKER_IMAGE_PREFIX = os.environ.get(
+    'SWEBENCH_DOCKER_IMAGE_PREFIX', 'docker.io/swebench/'
+)
 
 
-def get_instance_docker_image(instance_id: str) -> str:
+def get_instance_docker_image(instance_id: str, is_swegym: bool = True) -> str:
     """Return the docker image tag for a given instance_id.
 
-    Mirrors the logic in evaluation/benchmarks/swe_bench/run_infer.py.
+    SWE-Gym naming  (is_swegym=True):
+        docker.io/xingyaoww/sweb.eval.x86_64.astropy_s_astropy-12907
+
+    SWE-bench naming (is_swegym=False):
+        docker.io/swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest
+
+    Mirrors the logic in evaluation/benchmarks/swe_bench_optimized/run_infer.py.
     """
-    image_name = 'sweb.eval.x86_64.' + instance_id
-    image_name = image_name.replace('__', '_s_')  # github slash
-    image_name = image_name.replace('/', '_s_')
-    image_name = image_name.lower()
-    return DOCKER_IMAGE_PREFIX + image_name
+    if is_swegym:
+        image_name = 'sweb.eval.x86_64.' + instance_id
+        image_name = image_name.replace('__', '_s_')  # github slash
+        image_name = image_name.replace('/', '_s_')
+        image_name = image_name.lower()
+        return (DOCKER_IMAGE_PREFIX.rstrip('/') + '/' + image_name).lower()
+    else:
+        # Official SWE-bench image: sweb.eval.x86_64.<repo>_1776_<name>:latest
+        # instance_id format: "astropy__astropy-12907"
+        repo, name = instance_id.split('__', 1)
+        image_name = f'sweb.eval.x86_64.{repo}_1776_{name}:latest'.lower()
+        return (SWEBENCH_DOCKER_IMAGE_PREFIX.rstrip('/') + '/' + image_name).lower()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -538,9 +556,11 @@ def _eval_one_patch_in_runtime(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _get_runtime_config(instance_id: str, dataset_name: str) -> OpenHandsConfig:
+def _get_runtime_config(
+    instance_id: str, dataset_name: str, is_swegym: bool = True
+) -> OpenHandsConfig:
     """Build an OpenHandsConfig for the eval runtime of *instance_id*."""
-    image = get_instance_docker_image(instance_id)
+    image = get_instance_docker_image(instance_id, is_swegym=is_swegym)
     sandbox_config = get_default_sandbox_config_for_eval()
     sandbox_config.base_container_image = image
     sandbox_config.remote_runtime_resource_factor = get_instance_resource_factor(
@@ -568,7 +588,7 @@ def process_instance_all_runs(
     output_write_lock: threading.Lock,
 ) -> None:
     """Evaluate every run of *instance_id* inside a single Docker container."""
-    image_name = get_instance_docker_image(instance_id)
+    image_name = get_instance_docker_image(instance_id, is_swegym=is_swegym)
     total_runs = len(run_entries)
 
     # One log file per run. Container startup (create_runtime / connect) are
@@ -584,7 +604,7 @@ def process_instance_all_runs(
         f'Hint: run "tail -f {first_log_file}" to see live logs in a separate shell'
     )
 
-    config = _get_runtime_config(instance_id, dataset_name)
+    config = _get_runtime_config(instance_id, dataset_name, is_swegym=is_swegym)
 
     with _RunLogContext(first_log_file):
         try:
