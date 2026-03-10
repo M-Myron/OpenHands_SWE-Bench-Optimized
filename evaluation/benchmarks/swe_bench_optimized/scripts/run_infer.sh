@@ -112,7 +112,7 @@ function run_eval() {
   # Start periodic Docker cleanup in background
   (
     while true; do
-      sleep 3600  # Every 60 minutes (less frequent to avoid interference)
+      sleep 1800  # Every 60 minutes (less frequent to avoid interference)
       echo "Running periodic Docker cleanup..."
       # Remove stopped containers only
       docker container prune -f 2>/dev/null || true
