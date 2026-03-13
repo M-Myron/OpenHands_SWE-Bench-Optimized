@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import sys
 import subprocess
 import tempfile
 import time
@@ -414,16 +415,47 @@ if __name__ == '__main__':
         f'Loaded dataset {args.dataset} with split {args.split} to run inference on.'
     )
 
+    # Determine the evaluation output file path
+    output_file = args.input_file.replace('.jsonl', '.swebench_eval.jsonl')
+    
+    # Load already evaluated instances to skip them early
+    already_done = set()
+    if os.path.exists(output_file):
+        with open(output_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if 'instance_id' in data:
+                        already_done.add(str(data['instance_id']))
+                except json.JSONDecodeError:
+                    continue
+        logger.info(f'Found {len(already_done)} already evaluated instances in {output_file}. They will be skipped.')
+
     # Load predictions
     assert args.input_file.endswith('.jsonl'), 'Input file must be a jsonl file.'
     required_fields = ['instance_id', 'model_patch', 'test_result']
+    records = []
     with open(args.input_file) as f:
-        predictions = pd.DataFrame.from_records(
-            [
-                {k: v for k, v in json.loads(line).items() if k in required_fields}
-                for line in tqdm(f, desc='Loading predictions')
-            ]
-        )
+        for line in tqdm(f, desc='Loading predictions'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if str(obj.get('instance_id')) in already_done:
+                    continue
+                records.append({k: v for k, v in obj.items() if k in required_fields})
+            except json.JSONDecodeError:
+                continue
+                
+    if not records:
+        logger.info('No new predictions to evaluate. Exiting.')
+        sys.exit(0)
+        
+    predictions = pd.DataFrame.from_records(records)
     assert 'instance_id' in predictions.columns, (
         'Input file must contain instance_id column.'
     )

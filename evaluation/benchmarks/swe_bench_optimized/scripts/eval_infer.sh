@@ -84,7 +84,7 @@ echo "Running SWE-bench evaluation"
 echo "=============================================================="
 
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
-N_PROCESS=16
+N_PROCESS=4
 
 
 MODAL_FLAG=""
@@ -97,6 +97,21 @@ if [ -z "$INSTANCE_ID" ]; then
     # Default to SWE-Bench-lite
     # change `--dataset_name` and `--split` to alter dataset
 
+    # get the "model_name_or_path" from the first line of the SWEBENCH_FORMAT_JSONL
+    MODEL_NAME_OR_PATH=$(jq -r '.model_name_or_path' $SWEBENCH_FORMAT_JSONL | head -n 1)
+    echo "MODEL_NAME_OR_PATH: $MODEL_NAME_OR_PATH"
+
+    RESULT_OUTPUT_DIR=$(dirname $SWEBENCH_FORMAT_JSONL)
+    echo "RESULT_OUTPUT_DIR: $RESULT_OUTPUT_DIR"
+
+    # Restore previous logs so SWE-Bench can skip successfully processed instances
+    if [ -d "$RESULT_OUTPUT_DIR/eval_outputs" ]; then
+        echo "Found previous evaluation outputs. Restoring them to skip already processed instances..."
+        mkdir -p logs/run_evaluation/$RUN_ID
+        # copy the old eval_outputs to the place where swebench expects them
+        cp -r $RESULT_OUTPUT_DIR/eval_outputs logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH
+    fi
+
     poetry run python -m swebench.harness.run_evaluation \
         --dataset_name "$DATASET_NAME" \
         --split "$SPLIT" \
@@ -106,13 +121,6 @@ if [ -z "$INSTANCE_ID" ]; then
         --max_workers $N_PROCESS \
         --run_id $RUN_ID \
         $MODAL_FLAG
-
-    # get the "model_name_or_path" from the first line of the SWEBENCH_FORMAT_JSONL
-    MODEL_NAME_OR_PATH=$(jq -r '.model_name_or_path' $SWEBENCH_FORMAT_JSONL | head -n 1)
-    echo "MODEL_NAME_OR_PATH: $MODEL_NAME_OR_PATH"
-
-    RESULT_OUTPUT_DIR=$(dirname $SWEBENCH_FORMAT_JSONL)
-    echo "RESULT_OUTPUT_DIR: $RESULT_OUTPUT_DIR"
 
     # move the eval results to the target directory
     mkdir -p $RESULT_OUTPUT_DIR
