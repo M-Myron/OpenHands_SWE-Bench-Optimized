@@ -657,9 +657,13 @@ def process_instance_all_runs(
                 #
                 # Reset strategy (ordered by scope):
                 #   1. git reset --hard        – restore tracked files to HEAD
-                #   2. git clean -ffdx         – remove untracked/ignored files
-                #                                (-ff also recurses into submodules,
-                #                                 -x removes .pyc/__pycache__ etc.)
+                #   2. git clean -ffd          – remove untracked files
+                #                                (-ff also recurses into submodules)
+                #                                NOTE: we intentionally omit -x so that
+                #                                .gitignore'd compiled artifacts (e.g.
+                #                                Cython .so extensions pre-built in the
+                #                                Docker image) are NOT deleted.  Removing
+                #                                them would break imports in run 2+.
                 #   3. rm /tmp/{patch,eval}*   – clear previous run's tmp artefacts
                 #
                 # This does NOT undo pip/conda installs made by eval.sh, but those
@@ -670,7 +674,7 @@ def process_instance_all_runs(
                     reset_cmd = (
                         'cd /testbed'
                         ' && git reset --hard'
-                        ' && git clean -ffdx'          # -ff: submodules; -x: ignored
+                        ' && git clean -ffd'           # -ff: submodules; no -x to preserve compiled .so extensions
                         ' && rm -f /tmp/patch.diff /tmp/eval.sh /tmp/eval_output.log'
                     )
                     reset_action = CmdRunAction(command=reset_cmd)
