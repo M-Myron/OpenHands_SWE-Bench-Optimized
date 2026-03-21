@@ -1,9 +1,11 @@
 import asyncio
 import copy
+import errno
 import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from typing import Any, Literal
 
 import pandas as pd
@@ -66,6 +68,76 @@ from openhands.events.serialization.event import event_from_dict, event_to_dict
 from openhands.runtime.base import Runtime
 from openhands.utils.async_utils import call_async_from_sync
 from openhands.utils.shutdown_listener import sleep_if_should_continue
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if the pid appears alive (or inaccessible), False if gone."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_lock_owner_pid(lock_file: str) -> int | None:
+    try:
+        with open(lock_file, 'r') as f:
+            content = f.read().strip()
+    except OSError:
+        return None
+
+    if not content:
+        return None
+
+    try:
+        return int(content)
+    except ValueError:
+        return None
+
+
+def _try_reap_stale_prepare_slot(
+    lock_file: str,
+    stale_seconds: float,
+    lock_namespace: str,
+) -> bool:
+    """Best-effort stale lock cleanup for crashed workers."""
+    if stale_seconds <= 0:
+        return False
+
+    try:
+        stat = os.stat(lock_file)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+    age = time.time() - stat.st_mtime
+    if age < stale_seconds:
+        return False
+
+    owner_pid = _read_lock_owner_pid(lock_file)
+    if owner_pid is not None and _is_pid_alive(owner_pid):
+        return False
+
+    try:
+        os.remove(lock_file)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+    logger.warning(
+        'Removed stale env-prepare slot lock: %s (age=%.1fs, owner_pid=%s, namespace=%s)',
+        lock_file,
+        age,
+        owner_pid,
+        lock_namespace,
+    )
+    return True
 
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
@@ -706,11 +778,14 @@ def process_instance(
     )
 
     runtime = create_runtime(config)
-    call_async_from_sync(runtime.connect)
+    with _env_prepare_concurrency_slot():
+        call_async_from_sync(runtime.connect)
 
-    try:
+        # Runtime initialization is the environment preparation stage.
+        # Keep this inside the throttle so only a limited number of workers do it concurrently.
         initialize_runtime(runtime, instance, metadata)
 
+    try:
         message_action = get_instruction(instance, metadata)
 
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
@@ -779,6 +854,125 @@ def process_instance(
         error=state.last_error if state and state.last_error else None,
     )
     return output
+
+
+@contextmanager
+def _env_prepare_concurrency_slot():
+    """Limit concurrent runtime environment preparation across worker processes.
+
+    Controlled via OH_RUNTIME_PREPARE_MAX_CONCURRENCY.
+    - Missing/0/negative: no throttling
+    - Positive integer: at most N workers can prepare runtime env at once
+    """
+
+    raw_limit = os.environ.get('OH_RUNTIME_PREPARE_MAX_CONCURRENCY', '').strip()
+    if not raw_limit:
+        yield
+        return
+
+    try:
+        max_slots = int(raw_limit)
+    except ValueError:
+        logger.warning(
+            f'Invalid OH_RUNTIME_PREPARE_MAX_CONCURRENCY={raw_limit!r}; disabling env-prepare throttle.'
+        )
+        yield
+        return
+
+    if max_slots <= 0:
+        yield
+        return
+
+    lock_root = os.environ.get(
+        'OH_RUNTIME_PREPARE_LOCK_DIR', '/tmp/openhands_runtime_prepare_slots'
+    )
+    lock_namespace = os.environ.get('OH_RUNTIME_PREPARE_LOCK_NAMESPACE', 'default')
+    wait_log_seconds = float(
+        os.environ.get('OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS', '30')
+    )
+    timeout_seconds = float(
+        os.environ.get('OH_RUNTIME_PREPARE_TIMEOUT_SECONDS', '0')
+    )
+    stale_lock_seconds = float(
+        os.environ.get('OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS', '7200')
+    )
+    lock_dir = os.path.join(lock_root, lock_namespace)
+    os.makedirs(lock_dir, exist_ok=True)
+
+    slot_path = None
+    pid = os.getpid()
+    start_wait = time.time()
+    last_wait_log = start_wait
+
+    while slot_path is None:
+        for slot_idx in range(max_slots):
+            candidate = os.path.join(lock_dir, f'slot_{slot_idx}.lock')
+            try:
+                fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, 'w') as f:
+                    f.write(str(pid))
+                slot_path = candidate
+                break
+            except FileExistsError:
+                _try_reap_stale_prepare_slot(
+                    candidate,
+                    stale_seconds=stale_lock_seconds,
+                    lock_namespace=lock_namespace,
+                )
+                continue
+            except OSError as e:
+                if e.errno == errno.EMFILE:
+                    logger.warning(
+                        'EMFILE while acquiring env-prepare slot (pid=%s, namespace=%s); sleeping before retry.',
+                        pid,
+                        lock_namespace,
+                    )
+                    time.sleep(1.0)
+                    continue
+                raise
+
+        if slot_path is None:
+            now = time.time()
+            waited = now - start_wait
+            if timeout_seconds > 0 and waited >= timeout_seconds:
+                raise TimeoutError(
+                    'Timed out after '
+                    f'{waited:.1f}s waiting for env-prepare slot '
+                    f'(limit={max_slots}, namespace={lock_namespace}). '
+                    'If this happens after a crash/relaunch, try cleaning stale lock files '
+                    f'under {lock_dir}.'
+                )
+
+            if wait_log_seconds > 0 and now - last_wait_log >= wait_log_seconds:
+                active_locks = len([f for f in os.listdir(lock_dir) if f.endswith('.lock')])
+                logger.warning(
+                    'Waiting for env-prepare slot for %.1fs '
+                    '(limit=%s, pid=%s, namespace=%s, active_locks=%s).',
+                    waited,
+                    max_slots,
+                    pid,
+                    lock_namespace,
+                    active_locks,
+                )
+                last_wait_log = now
+
+            time.sleep(0.5)
+
+    waited_seconds = time.time() - start_wait
+    if waited_seconds >= 1:
+        logger.info(
+            f'Acquired env-prepare slot after waiting {waited_seconds:.1f}s '
+            f'(limit={max_slots}, pid={pid}, slot={os.path.basename(slot_path)}).'
+        )
+
+    try:
+        yield
+    finally:
+        if slot_path:
+            try:
+                os.remove(slot_path)
+            except FileNotFoundError:
+                pass
 
 
 def filter_dataset(dataset: pd.DataFrame, filter_column: str) -> pd.DataFrame:
