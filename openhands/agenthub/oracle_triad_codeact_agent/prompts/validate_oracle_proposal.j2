@@ -12,6 +12,9 @@ Evaluation criteria for proposal validity:
   - History Event 0: OpenHands system instruction.
   - History Event 1: SWE-bench task instruction and workflow phases.
 6) Workflow phase ordering (see Phase Enforcement below).
+{% if fact_preconditions %}
+7) Fact precondition satisfaction (see Fact Preconditions below).
+{% endif %}
 
 ## Workflow Phase Enforcement
 
@@ -27,6 +30,26 @@ History Event 1 defines a mandatory phase sequence for SWE-bench tasks:
 - **Skipping Phase 4 (test creation):** If no reproduction script has been created/run, jumping straight to analysis or editing is premature.
 
 **Why this matters:** These trajectories become SFT training data. A trajectory that jumps from "I see the code" to "let me edit it" teaches future models to skip analysis — producing brittle, hard-to-debug behavior. Each phase must be explicitly shown.
+
+{% if fact_preconditions %}
+## Fact Preconditions (from planner's referenced investigation facts)
+
+The oracle planner referenced specific investigation facts when crafting this proposal. Each referenced fact has preconditions — things that should already be established in the interaction history before the fact's knowledge is appropriate to apply. Use these preconditions as **additional validation criteria**:
+
+- If a precondition states "Must already have read file X" or "Must already have identified Y", check whether the interaction history actually shows that the debugger has performed that action or reached that understanding.
+- If preconditions are NOT met, the proposal is introducing knowledge that the debugger hasn't earned yet through its investigation — this is a form of unjustified knowledge jump.
+- Satisfied preconditions provide evidence that the proposal is well-grounded and the knowledge within it is reachable from the current history.
+
+{% for fp in fact_preconditions %}
+### Fact: {{ fp.fact_id }} (Stage: {{ fp.stage }})
+Summary: {{ fp.fact_summary }}
+Preconditions that should be satisfied:
+{% for pc in fp.preconditions %}
+  - {{ pc }}
+{% endfor %}
+
+{% endfor %}
+{% endif %}
 
 ## Public Issue Description
 {{ issue_text }}
@@ -47,6 +70,9 @@ Invalid red flags (automatic rejection):
 - **Phase 6 edit action (str_replace / code edit) proposed when Phase 5 analysis is missing from history** — the proposal should instead suggest a `think` call for fix analysis.
 - **Phase skip:** proposes an action belonging to Phase N+2 or later when Phase N has not been completed.
 - Proposals where the REASONING text does not explain the "why" — just stating "let me fix this" without justification is insufficient for SFT data quality.
+{% if fact_preconditions %}
+- **Unsatisfied fact preconditions:** If the proposal relies on knowledge from referenced facts whose preconditions are NOT met by the interaction history, this indicates an unjustified knowledge jump. The proposal should first perform the actions required by the unsatisfied preconditions.
+{% endif %}
 
 Return exactly one JSON object and nothing else:
 

@@ -76,15 +76,58 @@ def _build_issue_understanding(instance: pd.Series) -> str:
     return '\n'.join(lines).strip()
 
 
+def _load_preprocess_analysis(instance_id: str) -> str:
+    """Load preprocess analysis markdown if available."""
+    preprocess_dir = os.environ.get('ORACLE_PREPROCESS_DIR', '').strip()
+    if not preprocess_dir:
+        return ''
+    analysis_path = os.path.join(preprocess_dir, f'{instance_id}_analysis.md')
+    if not os.path.isfile(analysis_path):
+        logger.info(f'[OracleTriad] No preprocess analysis found at {analysis_path}')
+        return ''
+    try:
+        with open(analysis_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        logger.info(f'[OracleTriad] Loaded preprocess analysis ({len(content)} chars) from {analysis_path}')
+        return content
+    except Exception as exc:
+        logger.warning(f'[OracleTriad] Failed to read preprocess analysis: {exc}')
+        return ''
+
+
+def _load_react_facts(instance_id: str) -> dict | None:
+    """Load structured react facts JSON if available."""
+    preprocess_dir = os.environ.get('ORACLE_PREPROCESS_DIR', '').strip()
+    if not preprocess_dir:
+        return None
+    facts_path = os.path.join(preprocess_dir, f'{instance_id}_react_facts.json')
+    if not os.path.isfile(facts_path):
+        logger.info(f'[OracleTriad] No react facts found at {facts_path}')
+        return None
+    try:
+        with open(facts_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logger.info(f'[OracleTriad] Loaded react facts from {facts_path}')
+        return data
+    except Exception as exc:
+        logger.warning(f'[OracleTriad] Failed to read react facts: {exc}')
+        return None
+
+
 def _write_oracle_context_file(instance: pd.Series, metadata: EvalMetadata) -> str:
     context_dir = os.path.join(metadata.eval_output_dir, 'oracle_planner_context')
     os.makedirs(context_dir, exist_ok=True)
+
+    deep_analysis = _load_preprocess_analysis(str(instance.instance_id))
+    react_facts = _load_react_facts(str(instance.instance_id))
 
     payload = {
         'instance_id': str(instance.instance_id),
         'patch': str(instance.patch),
         'test_patch': str(instance.test_patch),
         'issue_understanding': _build_issue_understanding(instance),
+        'deep_analysis': deep_analysis,
+        'react_facts': react_facts,
     }
 
     path = os.path.join(context_dir, f'{instance.instance_id}.json')

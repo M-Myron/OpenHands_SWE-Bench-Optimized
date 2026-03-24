@@ -61,8 +61,11 @@ class OracleProposalCritic:
         history_text: str,
         proposal_response_text: str,
         attempt: int = 0,
+        fact_preconditions: list[dict] | None = None,
     ) -> ProposalValidationResult:
-        prompt = self._render_prompt(step_index, history_text, proposal_response_text)
+        prompt = self._render_prompt(
+            step_index, history_text, proposal_response_text, fact_preconditions
+        )
 
         for parse_retry in range(self.max_json_parse_retries + 1):
             try:
@@ -111,7 +114,11 @@ class OracleProposalCritic:
         )
 
     def _render_prompt(
-        self, step_index: int, history_text: str, proposal_response_text: str
+        self,
+        step_index: int,
+        history_text: str,
+        proposal_response_text: str,
+        fact_preconditions: list[dict] | None = None,
     ) -> str:
         template = self._jinja_env.get_template('validate_oracle_proposal.j2')
         return template.render(
@@ -119,6 +126,7 @@ class OracleProposalCritic:
             step_index=step_index,
             history_text=history_text,
             proposal_response_text=proposal_response_text,
+            fact_preconditions=fact_preconditions or [],
         )
 
     @staticmethod

@@ -79,6 +79,27 @@ Let me examine the arithmetic logic in the DynamoDB type handling code to unders
 
 The debugger will use your reasoning as its thought content and execute the suggested tool call. Both parts are essential — the reasoning ensures context-appropriate output, and the tool call ensures the right action is taken.
 
+{% if has_react_facts %}
+## Available Reference Facts (PRIVATE — for proposal guidance only)
+
+The following are structured investigation facts organized by workflow phase. Each fact has:
+- **fact_id**: A unique identifier you MUST reference in `referenced_fact_ids` when using it.
+- **fact**: The knowledge/insight content.
+- **preconditions**: Conditions that should be satisfied in the interaction history before this fact is appropriate to use.
+- **Recommended reasoning**: Suggested thought process text that can be adapted for the proposal's REASONING part.
+- **Recommended action**: Suggested action that can be adapted for the proposal's TOOL CALL part.
+
+**CRITICAL RULES for using facts:**
+1. **Check preconditions**: Before using a fact, verify its preconditions are met by the current interaction history. Only use facts whose preconditions are satisfied.
+2. **Stage alignment**: Facts are grouped by workflow phases. Use facts that match the current workflow phase the debugger is in.
+3. **Adapt, don't copy verbatim**: Use the recommended reasoning and action as inspiration, but rewrite them to fit naturally into the debugger's interaction context. The reasoning should read as the debugger's own thought process; the action should use the actual file paths and tool names available in the workspace.
+4. **Reference all used facts**: When proposing, list ALL fact IDs you drew from in `referenced_fact_ids`. This allows tracking which facts have been consumed.
+5. **Use facts aggressively**: If multiple facts are applicable at the current stage and their preconditions are met, try to incorporate as many as possible (either in a single proposal or by prioritizing the most impactful ones).
+6. **Once a fact is used, it will not appear again** in subsequent steps. Facts listed here are the remaining unused facts.
+
+{{ available_facts_text }}
+{% endif %}
+
 ## Public Issue Description (visible to debugger)
 {{ issue_text }}
 
@@ -107,7 +128,8 @@ Return exactly one JSON object and nothing else:
   "best_candidate_index": <int>,
   "chosen_candidate_index": <int or null>,
   "reason": "short explanation",
-  "proposal_response": "string, required when decision=proposal, else empty string"
+  "proposal_response": "string, required when decision=proposal, else empty string",
+  "referenced_fact_ids": ["fact_id_1", "fact_id_2"]
 }
 
 Rules:
@@ -115,3 +137,4 @@ Rules:
 - If decision is "proposal", chosen_candidate_index may be null, but proposal_response must be non-empty.
 - proposal_response MUST contain both REASONING text and a TOOL CALL suggestion (using exact tool names from the Available Tools section).
 - best_candidate_index must always be a valid candidate index.
+- referenced_fact_ids: list the fact IDs (e.g. "phase_3_exploration_0") you used to inform your proposal or candidate selection. Empty list if no facts were used. When proposing, you SHOULD reference at least one fact if any applicable unused facts remain.

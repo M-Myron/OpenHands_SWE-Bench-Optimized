@@ -357,8 +357,10 @@ def initialize_runtime(
     obs: CmdOutputObservation
 
     # Set instance id and git configuration
+    # Also export PAGER=cat to prevent help(), man, etc. from spawning
+    # interactive pagers that hang the agent shell.
     action = CmdRunAction(
-        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc && git config --global core.pager "" && git config --global diff.binary false"""
+        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo 'export PAGER=cat' >> ~/.bashrc && echo 'export GIT_PAGER=cat' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc && git config --global core.pager "" && git config --global diff.binary false"""
     )
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})

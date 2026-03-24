@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
@@ -22,6 +22,7 @@ class PlannerDecision:
     reason: str
     proposal_response_text: str
     raw_planner_response: str
+    referenced_fact_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +33,113 @@ class PlannerDecision:
             'reason': self.reason,
             'proposal_response_text': self.proposal_response_text,
             'raw_planner_response': self.raw_planner_response,
+            'referenced_fact_ids': self.referenced_fact_ids,
+        }
+
+
+class ReactFactTracker:
+    """Tracks structured react facts and their usage state across planner steps."""
+
+    def __init__(self, react_facts_data: dict | None) -> None:
+        self._facts: dict[str, dict] = {}
+        self._used: dict[str, bool] = {}
+        if react_facts_data and 'stages' in react_facts_data:
+            self._load_facts(react_facts_data['stages'])
+
+    def _load_facts(self, stages: list[dict]) -> None:
+        for stage_data in stages:
+            stage = stage_data.get('stage', 'unknown')
+            goal = stage_data.get('goal', '')
+            facts = stage_data.get('facts', [])
+            for idx, fact_data in enumerate(facts):
+                fact_id = f'{stage}_{idx}'
+                self._facts[fact_id] = {
+                    'fact_id': fact_id,
+                    'stage': stage,
+                    'goal': goal,
+                    'fact': fact_data.get('fact', ''),
+                    'preconditions': fact_data.get('preconditions', []),
+                    'reasoning': fact_data.get('reasoning_action_observation', {}).get('reasoning', ''),
+                    'action': fact_data.get('reasoning_action_observation', {}).get('action', ''),
+                    'observation': fact_data.get('reasoning_action_observation', {}).get('observation', ''),
+                }
+                self._used[fact_id] = False
+
+    @property
+    def has_facts(self) -> bool:
+        return len(self._facts) > 0
+
+    def get_available_facts(self) -> list[dict]:
+        """Return list of unused facts."""
+        return [f for fid, f in self._facts.items() if not self._used[fid]]
+
+    def get_all_fact_ids(self) -> list[str]:
+        return list(self._facts.keys())
+
+    def mark_facts_used(self, fact_ids: list[str]) -> None:
+        for fid in fact_ids:
+            if fid in self._used:
+                self._used[fid] = True
+                logger.info(f'[ReactFactTracker] Marked fact {fid} as used.')
+            else:
+                logger.warning(f'[ReactFactTracker] Unknown fact id: {fid}')
+
+    def get_preconditions_for_facts(self, fact_ids: list[str]) -> list[dict]:
+        """Return fact info with preconditions for specified fact IDs."""
+        result = []
+        for fid in fact_ids:
+            if fid in self._facts:
+                f = self._facts[fid]
+                result.append({
+                    'fact_id': fid,
+                    'stage': f['stage'],
+                    'fact_summary': f['fact'][:200] + '...' if len(f['fact']) > 200 else f['fact'],
+                    'preconditions': f['preconditions'],
+                })
+        return result
+
+    def render_available_facts_text(self) -> str:
+        """Render unused facts as structured text for the planner prompt."""
+        available = self.get_available_facts()
+        if not available:
+            return '(All facts have been used in previous steps.)'
+
+        # Group by stage
+        by_stage: dict[str, list[dict]] = {}
+        for f in available:
+            stage = f['stage']
+            if stage not in by_stage:
+                by_stage[stage] = []
+            by_stage[stage].append(f)
+
+        lines: list[str] = []
+        for stage, facts in by_stage.items():
+            goal = facts[0]['goal'] if facts else ''
+            lines.append(f'### Stage: {stage}')
+            if goal:
+                lines.append(f'Goal: {goal}')
+            lines.append('')
+            for f in facts:
+                lines.append(f'**[{f["fact_id"]}]** {f["fact"]}')
+                if f['preconditions']:
+                    lines.append('  Preconditions:')
+                    for pc in f['preconditions']:
+                        lines.append(f'    - {pc}')
+                if f['reasoning']:
+                    lines.append(f'  Recommended reasoning: {f["reasoning"]}')
+                if f['action']:
+                    lines.append(f'  Recommended action: {f["action"]}')
+                lines.append('')
+        return '\n'.join(lines).strip()
+
+    def get_usage_summary(self) -> dict:
+        total = len(self._facts)
+        used = sum(1 for v in self._used.values() if v)
+        return {
+            'total_facts': total,
+            'used_facts': used,
+            'remaining_facts': total - used,
+            'used_fact_ids': [fid for fid, v in self._used.items() if v],
         }
 
 
@@ -45,11 +153,19 @@ class OraclePlanner:
 
     PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
 
-    def __init__(self, llm: LLM, issue_text: str, oracle_context: str, tool_descriptions: str = '') -> None:
+    def __init__(
+        self,
+        llm: LLM,
+        issue_text: str,
+        oracle_context: str,
+        tool_descriptions: str = '',
+        react_fact_tracker: ReactFactTracker | None = None,
+    ) -> None:
         self.llm = llm
         self.issue_text = issue_text
         self.oracle_context = oracle_context
         self.tool_descriptions = tool_descriptions
+        self.react_fact_tracker = react_fact_tracker
         self.max_json_parse_retries = max(
             int(os.environ.get('ORACLE_PLANNER_JSON_PARSE_MAX_RETRIES', '3')),
             0,
@@ -131,6 +247,12 @@ class OraclePlanner:
         candidates: list[str],
         planner_feedback: str,
     ) -> str:
+        available_facts_text = ''
+        has_react_facts = False
+        if self.react_fact_tracker and self.react_fact_tracker.has_facts:
+            available_facts_text = self.react_fact_tracker.render_available_facts_text()
+            has_react_facts = True
+
         template = self._jinja_env.get_template('planner_select_or_propose.j2')
         return template.render(
             issue_text=self.issue_text,
@@ -140,6 +262,8 @@ class OraclePlanner:
             candidates=candidates,
             planner_feedback=planner_feedback,
             tool_descriptions=self.tool_descriptions,
+            available_facts_text=available_facts_text,
+            has_react_facts=has_react_facts,
         )
 
     @staticmethod
@@ -176,6 +300,7 @@ class OraclePlanner:
         chosen_idx = cls._safe_index(chosen_idx_raw, num_candidates)
         reason = str(data.get('reason', ''))
         proposal_text = str(data.get('proposal_response', '') or '')
+        referenced_fact_ids = [str(x) for x in data.get('referenced_fact_ids', []) if x]
 
         if decision not in {'candidate', 'proposal'}:
             decision = 'candidate'
@@ -191,6 +316,7 @@ class OraclePlanner:
                 reason=reason or 'Planner selected a candidate.',
                 proposal_response_text='',
                 raw_planner_response=raw_text,
+                referenced_fact_ids=referenced_fact_ids,
             )
 
         if not proposal_text.strip():
@@ -205,6 +331,7 @@ class OraclePlanner:
                 reason=reason or 'Planner proposal empty; fallback to best candidate.',
                 proposal_response_text='',
                 raw_planner_response=raw_text,
+                referenced_fact_ids=referenced_fact_ids,
             )
 
         return PlannerDecision(
@@ -215,6 +342,7 @@ class OraclePlanner:
             reason=reason or 'Planner proposed a better next response.',
             proposal_response_text=proposal_text,
             raw_planner_response=raw_text,
+            referenced_fact_ids=referenced_fact_ids,
         )
 
     @classmethod
@@ -282,7 +410,13 @@ class OraclePlanner:
             logger.warning(f'[OraclePlanner] Failed to save prompt debug file: {exc}')
 
     @classmethod
-    def from_env(cls, issue_text: str, oracle_context: str, tool_descriptions: str = '') -> 'OraclePlanner | None':
+    def from_env(
+        cls,
+        issue_text: str,
+        oracle_context: str,
+        tool_descriptions: str = '',
+        react_fact_tracker: ReactFactTracker | None = None,
+    ) -> 'OraclePlanner | None':
         from openhands.core.config.utils import get_llm_config_arg
 
         config_name = os.environ.get('ORACLE_PLANNER_LLM_CONFIG', 'oracle_planner')
@@ -305,4 +439,15 @@ class OraclePlanner:
         logger.info(
             f'[OraclePlanner] Initialized with model={llm_config.model} config_name={config_name}'
         )
-        return cls(llm=llm, issue_text=issue_text, oracle_context=oracle_context, tool_descriptions=tool_descriptions)
+        if react_fact_tracker and react_fact_tracker.has_facts:
+            summary = react_fact_tracker.get_usage_summary()
+            logger.info(
+                f'[OraclePlanner] React facts loaded: {summary["total_facts"]} facts available.'
+            )
+        return cls(
+            llm=llm,
+            issue_text=issue_text,
+            oracle_context=oracle_context,
+            tool_descriptions=tool_descriptions,
+            react_fact_tracker=react_fact_tracker,
+        )

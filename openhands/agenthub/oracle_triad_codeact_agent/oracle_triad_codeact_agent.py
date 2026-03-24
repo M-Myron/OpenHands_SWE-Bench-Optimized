@@ -9,6 +9,7 @@ from openhands.agenthub.codeact_agent.codeact_agent import CodeActAgent
 from openhands.agenthub.oracle_triad_codeact_agent.oracle_planner import (
     OraclePlanner,
     PlannerDecision,
+    ReactFactTracker,
 )
 from openhands.agenthub.oracle_triad_codeact_agent.proposal_critic import (
     OracleProposalCritic,
@@ -193,11 +194,22 @@ class OracleTriadCodeActAgent(CodeActAgent):
             self.triad_log.append(planner_entry)
             _append_triage_entry(planner_entry)
 
+            # Get preconditions for referenced facts (for critic validation)
+            fact_preconditions: list[dict] = []
+            referenced_ids = decision.referenced_fact_ids
+            if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
+                fact_preconditions = self._oracle_planner.react_fact_tracker.get_preconditions_for_facts(
+                    referenced_ids
+                )
+
             if decision.decision == 'candidate':
                 idx = decision.chosen_candidate_index
                 if idx is None or idx < 0 or idx >= len(candidate_responses):
                     idx = planner_best_idx
                 chosen_response = candidate_responses[idx]
+                # Mark referenced facts as used on accepted decision
+                if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
+                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
                 break
 
             if self._proposal_critic is None:
@@ -206,6 +218,9 @@ class OracleTriadCodeActAgent(CodeActAgent):
                     planner_proposal=decision.proposal_response_text,
                     state=state,
                 )
+                # Mark referenced facts as used on accepted proposal (no critic)
+                if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
+                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
                 break
 
             validation = self._proposal_critic.validate(
@@ -213,6 +228,7 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 history_text=full_history_text,
                 proposal_response_text=decision.proposal_response_text,
                 attempt=planner_attempt,
+                fact_preconditions=fact_preconditions if fact_preconditions else None,
             )
 
             critic_entry = {
@@ -230,6 +246,9 @@ class OracleTriadCodeActAgent(CodeActAgent):
                     planner_proposal=decision.proposal_response_text,
                     state=state,
                 )
+                # Mark referenced facts as used on accepted proposal
+                if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
+                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
                 break
 
             if planner_attempt < self._planner_max_retries:
@@ -252,6 +271,17 @@ class OracleTriadCodeActAgent(CodeActAgent):
             )
             chosen_response = candidate_responses[0]
 
+        # Log fact usage summary
+        if self._oracle_planner and self._oracle_planner.react_fact_tracker and self._oracle_planner.react_fact_tracker.has_facts:
+            usage_summary = self._oracle_planner.react_fact_tracker.get_usage_summary()
+            fact_entry = {
+                'step_index': step_index,
+                'event': 'react_fact_usage_summary',
+                **usage_summary,
+            }
+            self.triad_log.append(fact_entry)
+            _append_triage_entry(fact_entry)
+
         actions = self.response_to_actions(chosen_response)
         for action in actions:
             self.pending_actions.append(action)
@@ -266,13 +296,16 @@ class OracleTriadCodeActAgent(CodeActAgent):
             public_issue_text = self._extract_issue_description(stripped_issue_text)
             if not public_issue_text:
                 public_issue_text = stripped_issue_text
-            oracle_context = self._load_oracle_context()
+            oracle_context, react_facts_data = self._load_oracle_context()
             tool_descriptions = self._build_tool_descriptions()
+
+            react_fact_tracker = ReactFactTracker(react_facts_data)
 
             self._oracle_planner = OraclePlanner.from_env(
                 issue_text=public_issue_text,
                 oracle_context=oracle_context,
                 tool_descriptions=tool_descriptions,
+                react_fact_tracker=react_fact_tracker,
             )
             self._proposal_critic = OracleProposalCritic.from_env(
                 issue_text=public_issue_text,
@@ -406,10 +439,11 @@ class OracleTriadCodeActAgent(CodeActAgent):
         )
         return list(messages) + [message]
 
-    def _load_oracle_context(self) -> str:
+    def _load_oracle_context(self) -> tuple[str, dict | None]:
+        """Load oracle context and return (context_text, react_facts_data)."""
         context_path = os.environ.get('ORACLE_PLANNER_CONTEXT_PATH', '').strip()
         if not context_path:
-            return 'No oracle context file was provided.'
+            return 'No oracle context file was provided.', None
 
         try:
             with open(context_path, 'r', encoding='utf-8') as f:
@@ -418,11 +452,13 @@ class OracleTriadCodeActAgent(CodeActAgent):
             logger.warning(
                 f'[OracleTriadCodeActAgent] Failed to load oracle context from {context_path}: {exc}'
             )
-            return f'Failed to load oracle context ({exc}).'
+            return f'Failed to load oracle context ({exc}).', None
 
         patch = str(payload.get('patch', '') or '')
         test_patch = str(payload.get('test_patch', '') or '')
         issue_understanding = str(payload.get('issue_understanding', '') or '')
+        deep_analysis = str(payload.get('deep_analysis', '') or '')
+        react_facts = payload.get('react_facts', None)
 
         parts = [
             '## Golden Patch',
@@ -434,7 +470,20 @@ class OracleTriadCodeActAgent(CodeActAgent):
             '## Issue Understanding Package',
             issue_understanding if issue_understanding else '(not provided)',
         ]
-        return '\n'.join(parts)
+
+        if deep_analysis:
+            parts.extend([
+                '',
+                '## Deep Root-Cause Analysis',
+                'The following is a detailed precomputed analysis of the bug, including '
+                'step-by-step traces from user action to crash, the fixed chain, '
+                'knowledge requirements, and investigation logs. Use this to guide '
+                'the debugger toward the correct fix without leaking specifics.',
+                '',
+                deep_analysis,
+            ])
+
+        return '\n'.join(parts), react_facts
 
     def _build_tool_descriptions(self) -> str:
         """Build a human-readable summary of available tools for the planner."""

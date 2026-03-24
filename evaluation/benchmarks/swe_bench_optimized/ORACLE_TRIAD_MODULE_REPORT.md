@@ -1,6 +1,6 @@
 # Oracle Triad Experiment - Module Report
 
-_Workspace_: `/home/chentianyu/murong/code/OpenHands_SWE-Bench-Optimized`  
+_Workspace_: `/home/v-murongma/code/OpenHands_SWE-Bench-Optimized`  
 _Purpose_: triad orchestration with **Blinded Debugger** + **Oracle Planner** + **Blinded Proposal Critic** for SWE-bench trajectories.
 
 ---
@@ -25,12 +25,13 @@ If critic rejects a proposal, feedback is sent back to planner for retry. When r
 |------|------|
 | `openhands/agenthub/oracle_triad_codeact_agent/__init__.py` | Registers `OracleTriadCodeActAgent` in `Agent` registry |
 | `openhands/agenthub/oracle_triad_codeact_agent/oracle_triad_codeact_agent.py` | Main triad orchestration agent + per-process triad logging helpers |
-| `openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py` | Oracle planner LLM wrapper + `PlannerDecision` parsing |
+| `openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py` | Oracle planner LLM wrapper + `PlannerDecision` parsing + `ReactFactTracker` |
 | `openhands/agenthub/oracle_triad_codeact_agent/proposal_critic.py` | Blinded proposal critic wrapper + `ProposalValidationResult` |
-| `openhands/agenthub/oracle_triad_codeact_agent/prompts/planner_select_or_propose.j2` | Planner prompt template |
-| `openhands/agenthub/oracle_triad_codeact_agent/prompts/validate_oracle_proposal.j2` | Proposal critic prompt template |
-| `evaluation/benchmarks/swe_bench_optimized/run_infer_oracle_triad.py` | Eval entrypoint + per-instance oracle context writer |
+| `openhands/agenthub/oracle_triad_codeact_agent/prompts/planner_select_or_propose.j2` | Planner prompt template (includes react facts section) |
+| `openhands/agenthub/oracle_triad_codeact_agent/prompts/validate_oracle_proposal.j2` | Proposal critic prompt template (includes fact preconditions section) |
+| `evaluation/benchmarks/swe_bench_optimized/run_infer_oracle_triad.py` | Eval entrypoint + per-instance oracle context writer + react facts loader |
 | `evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh` | Shell launcher |
+| `evaluation/evaluation_outputs/outputs/.../preprocess/{id}_react_facts.json` | Per-instance structured react facts (input data) |
 
 ---
 
@@ -55,15 +56,17 @@ Key runtime fields:
 3. Build **full** history text from `state.history` for planner/critic.
 4. Generate `N` debugger candidates by calling primary LLM `N` times.
 5. Planner loop (`0.._planner_max_retries`):
-   - planner returns decision (`candidate` or `proposal`) plus `best_candidate_index`.
-   - if `candidate`: choose selected/best candidate and continue.
+   - planner returns decision (`candidate` or `proposal`) plus `best_candidate_index` and `referenced_fact_ids`.
+   - extract `referenced_fact_ids` and get preconditions from `ReactFactTracker`.
+   - if `candidate`: choose selected/best candidate, mark referenced facts as used, and continue.
    - if `proposal`:
-     - if critic disabled, materialize proposal directly;
-     - else validate proposal with blinded critic.
-     - if critic passes: materialize proposal.
+     - if critic disabled, materialize proposal directly and mark facts used;
+     - else validate proposal with blinded critic (passing `fact_preconditions`).
+     - if critic passes: materialize proposal and mark facts used.
      - if critic fails and retries remain: send feedback back to planner.
      - if retries exhausted: fallback to planner `best_candidate_index`.
-6. Convert chosen response to actions and return first queued action.
+6. Log `react_fact_usage_summary` event (total/used/remaining facts).
+7. Convert chosen response to actions and return first queued action.
 
 #### Proposal materialization detail
 
@@ -112,6 +115,21 @@ Fields:
 - `reason: str`
 - `proposal_response_text: str`
 - `raw_planner_response: str`
+- `referenced_fact_ids: list[str]` (default `[]`) — IDs of react facts referenced by the planner in this decision
+
+Class: `ReactFactTracker`
+
+Manages structured react facts and their per-step usage state. Loaded from `{instance_id}_react_facts.json`.
+
+Key API:
+
+- `__init__(react_facts_data: dict | None)` — parses JSON `stages[].facts[]`, generates IDs like `phase_3_exploration_0`
+- `has_facts -> bool`
+- `get_available_facts() -> list[dict]` — returns unused facts
+- `mark_facts_used(fact_ids: list[str])` — marks facts as consumed; they no longer appear in prompt
+- `get_preconditions_for_facts(fact_ids) -> list[dict]` — returns fact ID, stage, summary, and preconditions for specified IDs
+- `render_available_facts_text() -> str` — renders unused facts grouped by stage with fact content, preconditions, recommended reasoning, and recommended action
+- `get_usage_summary() -> dict` — returns `{total_facts, used_facts, remaining_facts, used_fact_ids}`
 
 Behavior:
 
@@ -126,10 +144,11 @@ Behavior:
 
 Factory:
 
-- `from_env(issue_text, oracle_context, tool_descriptions='')`
+- `from_env(issue_text, oracle_context, tool_descriptions='', react_fact_tracker=None)`
 - config key: `ORACLE_PLANNER_LLM_CONFIG` (default `oracle_planner`)
 - disables completion logging (`llm_config.log_completions = False`)
 - `tool_descriptions` is passed to `_render_prompt` and rendered in the Jinja template "Available Tools" section
+- `react_fact_tracker` (if provided with facts) logs fact count at init and passes available facts text to each prompt render
 
 ---
 
@@ -153,6 +172,7 @@ Behavior:
 - Enforced invariant:
   - non-empty `unjustified_knowledge` => forced `valid=False`
 - Builds rejection feedback for planner retries.
+- `validate()` accepts optional `fact_preconditions: list[dict] | None` — when provided, these are rendered in the critic prompt as additional validation criteria for the proposal.
 - Optional prompt dump:
   - set `ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS_DIR`
 
@@ -176,6 +196,7 @@ Input sections:
 - private oracle context
 - **available tool descriptions** (conditional, from `tool_descriptions` variable)
 - **proposal format requirements** (REASONING + TOOL CALL structure)
+- **available reference facts** (conditional, from `available_facts_text` when `has_react_facts` is true) — unused facts grouped by stage with IDs, preconditions, recommended reasoning/action
 - full interaction history
 - debugger candidates
 - optional critic feedback
@@ -188,7 +209,8 @@ Output JSON schema (required):
   "best_candidate_index": 0,
   "chosen_candidate_index": 0,
   "reason": "...",
-  "proposal_response": "..."
+  "proposal_response": "...",
+  "referenced_fact_ids": ["phase_1_reading_0", "phase_3_exploration_2"]
 }
 ```
 
@@ -196,7 +218,9 @@ Important hard rules in prompt:
 
 - planner must **always** output `best_candidate_index`, even when proposing.
 - `proposal_response` MUST contain both REASONING text and a `[TOOL CALL]` suggestion using exact tool names from the Available Tools section.
+- `referenced_fact_ids` MUST list all fact IDs used to inform the decision. When proposing, should reference at least one fact if applicable unused facts remain.
 - **SFT Data Quality & Workflow Phase Discipline**: explicit 8-phase workflow ordering enforced. NEVER propose/select Phase 6 (edit) without Phase 5 (analysis) shown in history. When all candidates skip a phase, MUST propose the missing phase step.
+- **Fact usage rules**: check preconditions before using a fact, adapt reasoning/action (don't copy verbatim), use facts aggressively when preconditions are met.
 
 ### 4.2 Proposal critic prompt
 
@@ -210,6 +234,7 @@ Checks:
 - no implementation details absent from history/issue
 - **workflow phase ordering**: rejects proposals that skip required phases (e.g., Phase 6 edit without Phase 5 analysis in history).
 - **SFT reasoning quality**: rejects proposals whose REASONING text doesn't explain "why"
+- **fact precondition validation** (conditional): when `fact_preconditions` list is non-empty, the critic checks whether preconditions of referenced facts are satisfied by the interaction history. Unsatisfied preconditions indicate an unjustified knowledge jump.
 
 Output JSON schema:
 
@@ -259,6 +284,8 @@ Written JSON keys:
 - `patch`
 - `test_patch`
 - `issue_understanding`
+- `deep_analysis` — markdown from `{instance_id}_analysis.md` (if exists)
+- `react_facts` — structured JSON from `{instance_id}_react_facts.json` (if exists)
 
 `issue_understanding` is assembled from optional dataset columns if present:
 
@@ -313,6 +340,7 @@ Typical event types:
 - `debugger_candidate`
 - `oracle_planner_decision`
 - `proposal_critic_validation`
+- `react_fact_usage_summary`
 
 Representative examples:
 
@@ -335,7 +363,8 @@ Representative examples:
   "chosen_candidate_index": null,
   "reason": "...",
   "proposal_response_text": "...",
-  "raw_planner_response": "..."
+  "raw_planner_response": "...",
+  "referenced_fact_ids": ["phase_3_exploration_0", "phase_3_exploration_1"]
 }
 ```
 
@@ -351,6 +380,17 @@ Representative examples:
   "feedback_message": "...",
   "proposal_response_text": "...",
   "raw_critic_response": "..."
+}
+```
+
+```json
+{
+  "step_index": 3,
+  "event": "react_fact_usage_summary",
+  "total_facts": 17,
+  "used_facts": 5,
+  "remaining_facts": 12,
+  "used_fact_ids": ["phase_1_reading_0", "phase_3_exploration_0", "..."]
 }
 ```
 
@@ -508,40 +548,166 @@ python run_infer_oracle_triad.py ... --instance-ids django__django-12345 astropy
 
 When omitted, all instances are evaluated as before (no behavioral change).
 
+### Session: 2025-03-24 — Structured React Facts Integration
+
+All changes add structured react-fact-based guidance to the planner, with stateful tracking and precondition-based critic validation.
+
+#### 9.11 React Facts JSON Format and Loading
+
+**Files**:
+- `run_infer_oracle_triad.py` — new `_load_react_facts()` function, `_write_oracle_context_file()` updated
+- `oracle_triad_codeact_agent.py` — `_load_oracle_context()` returns `(context_text, react_facts_data)` tuple
+
+**Problem**: The oracle planner received background knowledge as free-form markdown (`{instance_id}_analysis.md`). This was unstructured — the planner had no way to know which facts were relevant at which workflow phase, what preconditions they required, or what actions they recommended.
+
+**Solution**: Added support for structured `{instance_id}_react_facts.json` files. Format:
+```json
+{
+  "stages": [
+    {
+      "stage": "phase_3_exploration",
+      "goal": "...",
+      "facts": [
+        {
+          "fact": "Query.output_field property returns self.select[0].field...",
+          "preconditions": ["Should be in phase_3_exploration or later.", "Must already have identified..."],
+          "reasoning_action_observation": {
+            "reasoning": "The crash depends on what output_field the Subquery resolves to...",
+            "action": "read_file path=.../query.py, lines 225–250",
+            "observation": "Query.output_field property at line 237..."
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+The `_load_react_facts()` function loads this from `ORACLE_PREPROCESS_DIR/{instance_id}_react_facts.json` and passes it as `react_facts` in the oracle context payload JSON. `_load_oracle_context()` now returns a tuple `(context_text, react_facts_data)`, where `react_facts_data` is the raw parsed dict (or `None`).
+
+#### 9.12 ReactFactTracker Class
+
+**File**: `oracle_planner.py` — new class `ReactFactTracker`
+
+**Purpose**: Manages structured react facts with per-step usage tracking.
+
+**Design**:
+- On init, parses `stages[].facts[]` and assigns unique IDs: `{stage}_{index}` (e.g., `phase_3_exploration_0`)
+- Stores each fact's content, stage, goal, preconditions, recommended reasoning, and recommended action
+- Maintains a `_used: dict[str, bool]` map — facts start unused, and are marked used after accepted planner decisions
+- `render_available_facts_text()` renders only unused facts grouped by stage — used facts are omitted from subsequent prompts
+- `get_preconditions_for_facts(fact_ids)` returns structured preconditions for given fact IDs, for passing to the critic
+
+**Integration**: Created in `_init_components()` and passed to `OraclePlanner.from_env()`. The tracker lives on the `OraclePlanner` instance and persists across steps.
+
+#### 9.13 Planner Prompt — Available Reference Facts Section
+
+**File**: `planner_select_or_propose.j2`
+
+**Additions**:
+- New conditional section `## Available Reference Facts (PRIVATE — for proposal guidance only)` rendered when `has_react_facts` is true
+- Each fact displayed with: `[fact_id]`, fact content, preconditions, recommended reasoning, recommended action
+- Six usage rules: check preconditions, align with current stage, adapt don't copy verbatim, reference all used fact IDs, use aggressively, once used they disappear
+- Output JSON schema now includes `"referenced_fact_ids": ["fact_id_1", "fact_id_2"]`
+- New rule: when proposing, should reference at least one fact if applicable unused facts remain
+
+#### 9.14 PlannerDecision — referenced_fact_ids Field
+
+**File**: `oracle_planner.py` — `PlannerDecision` dataclass, `_parse_response_or_none()`
+
+**Additions**:
+- New field `referenced_fact_ids: list[str]` (default `[]`) on `PlannerDecision`
+- Included in `to_dict()` serialization
+- `_parse_response_or_none()` extracts `referenced_fact_ids` from the planner's JSON output and passes them through to the decision
+
+#### 9.15 Fact Preconditions Passed to Critic
+
+**Files**:
+- `proposal_critic.py` — `validate()` and `_render_prompt()` accept `fact_preconditions: list[dict] | None`
+- `validate_oracle_proposal.j2` — conditional `## Fact Preconditions` section
+
+**Design**: When the planner references facts in a proposal, the orchestration agent extracts preconditions for those facts via `ReactFactTracker.get_preconditions_for_facts()`. These are passed to `OracleProposalCritic.validate(fact_preconditions=...)`.
+
+The critic template renders a "Fact Preconditions" section (conditional on non-empty list) that:
+- Explains each referenced fact's ID, stage, summary, and preconditions
+- Instructs the critic to check whether preconditions are satisfied by the interaction history
+- Adds rejection rule: "Unsatisfied fact preconditions indicate an unjustified knowledge jump"
+
+When `fact_preconditions` is empty or `None`, the section is omitted entirely (backward compatible).
+
+#### 9.16 Orchestration Loop — Fact Tracking Integration
+
+**File**: `oracle_triad_codeact_agent.py` — `step()` method
+
+**Changes to planner loop**:
+1. After each planner decision, extract `referenced_fact_ids` from the decision
+2. Get `fact_preconditions` via `ReactFactTracker.get_preconditions_for_facts(referenced_ids)`
+3. Pass `fact_preconditions` to `OracleProposalCritic.validate()` when validating proposals
+4. On accepted decision (candidate selected or proposal approved), call `ReactFactTracker.mark_facts_used(referenced_ids)` — facts are consumed and removed from future prompts
+5. After the planner loop, log a `react_fact_usage_summary` event with total/used/remaining counts and used fact IDs
+
+#### 9.17 Verified Outputs — django__django-12663 Run
+
+Run: GLM-5-FP8, v0.61.0-oracle-triad, `princeton-nlp/SWE-bench_Verified` test split, instance `django__django-12663`
+
+**React facts loaded**: 17 facts across 5 stages (phase_1_reading: 1, phase_3_exploration: 12, phase_4_test_creation: 1, phase_5_fix_analysis: 2, phase_6_fix_implementation: 1)
+
+**Fact consumption progression**:
+- Step 1: 1/17 used (phase_1_reading_0 — crash site identification)
+- Step 8: 2/17 (+ phase_4_test_creation_0)
+- Step 10–14: 3→7/17 (exploration facts consumed progressively)
+- Step 16–18: 8→10/17 (more exploration facts)
+- Step 20: 11/17 (+ phase_5_fix_analysis_0)
+- Step 22: 13/17 (+ phase_6_fix_implementation_0)
+- Steps 23–57: plateaued at 15/17 (2 remaining facts never consumed: phase_3_exploration_3, phase_3_exploration_10)
+
+**Planner fact reference behavior**:
+- 62 planner decisions total, 24 referenced at least one fact
+- Facts referenced in both `candidate` and `proposal` decisions
+- Multiple facts referenced in single decisions (e.g., step 14: `phase_3_exploration_4` + `phase_3_exploration_5`)
+
+**Critic with preconditions**:
+- 21 critic validations total
+- Critic correctly rejected proposals with unsatisfied preconditions (e.g., step 5: rejected for phase ordering violation, step 8: rejected for skipping Phase 2, step 23: rejected for incomplete Phase 4)
+
+**Remaining issues observed**:
+- 2 of 17 facts were never consumed (phase_3_exploration_3, phase_3_exploration_10) — may need to investigate whether their preconditions were never met or the planner simply didn't pick them up
+- Planner stopped referencing facts after step 37 even though 2 remained — the trajectory ran 57 steps total, suggesting the debugger got stuck in a verification loop
+- `referenced_fact_ids` is sometimes referenced with stale IDs from already-used facts (e.g., step 8 attempt 0 references `phase_3_exploration_0` which was later consumed at step 10, but was referenced before being consumed — this is correct behavior since facts are only marked used on accepted decisions)
+
 ---
 
 ## 10. Suggested Next-Session Continuation Checklist
 
-1. Run one smoke eval (`EVAL_LIMIT=1`) with the latest code and verify:
-   - oracle context file generated,
-   - triad logs populated,
-   - planner/critic retries visible when expected,
-   - **new**: tool descriptions appear in planner prompts,
-   - **new**: proposals contain both REASONING + TOOL CALL parts.
-2. Investigate materialization quality: does the debugger faithfully execute the planner's suggested tool call when the two-part guidance is injected?
-   - Check if the debugger ignores the `[TOOL CALL]` suggestion and does something else.
-   - Check if the debugger duplicates reasoning or adds unnecessary preamble.
-3. Add aggregate analysis script/notebook for `oracle_triad_logs/`:
-   - proposal rate,
-   - critic rejection rate,
-   - fallback-to-best-candidate rate,
-   - average planner attempts per step.
-4. Stress test with high `BLINDED_DEBUGGER_NUM_CANDIDATES` for latency/cost behavior.
-5. Evaluate whether planner guidance materialization should be replaced by direct structured action output to reduce one extra debugger call.
-6. Consider stricter fail behavior (or bounded fail-open) for proposal critic depending on reliability findings.
-7. Tune truncation limits in `_build_tool_descriptions()` (currently 500 chars for tool desc, 200 chars per param desc) — review whether longer descriptions help or hurt planner decision quality.
+1. **Investigate unconsumed facts**: In the django__django-12663 run, 2/17 facts were never used (`phase_3_exploration_3`, `phase_3_exploration_10`). Check if their preconditions were impossible to satisfy given the trajectory, or if the planner needs prompt tuning to use them.
+2. **Evaluate fact usage quality**: Review planner prompts to see whether fact reasoning/actions are being adapted well (vs. copied verbatim or ignored). Check if the recommended action paths match the actual workspace file layout.
+3. **Test on more instances**: Run with additional react facts JSONs to verify generalization. Create `{instance_id}_react_facts.json` files for other SWE-bench instances.
+4. **Fact precondition enforcement in critic**: Verify the critic is actually using preconditions to reject proposals with unsatisfied preconditions (not just rubber-stamping). Check critic prompt dumps for evidence.
+5. **Late-trajectory stall**: The django run plateaued at 15/17 facts used from step 37 onwards (20 more steps with no new fact consumption). Investigate if the debugger got stuck in a verification/retry loop and whether fact-guided proposals could have helped break out.
+6. **Fact-driven proposal vs. candidate selection**: Currently facts can be referenced in both `candidate` and `proposal` decisions. Consider whether fact references in `candidate` decisions should also mark facts as used (they currently do — verify this is desired).
+7. Run materialization quality check: does the debugger faithfully execute fact-guided proposals?
+8. Stress test with high `BLINDED_DEBUGGER_NUM_CANDIDATES` for latency/cost behavior.
+9. Consider stricter fail behavior (or bounded fail-open) for proposal critic depending on reliability findings.
 
 ---
 
 ## 11. Minimal Run Example
 
 ```bash
-cd /home/chentianyu/murong/code/OpenHands_SWE-Bench-Optimized
+cd /home/v-murongma/code/OpenHands_SWE-Bench-Optimized
 
 bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
   llm.eval_qwen3_coder_30b_a3b_instruct HEAD OracleTriadCodeActAgent 1 100 1 \
   princeton-nlp/SWE-bench_Verified test 1
 ```
+
+To use react facts, set the preprocess directory:
+
+```bash
+export ORACLE_PREPROCESS_DIR="/home/v-murongma/code/OpenHands_SWE-Bench-Optimized/evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/preprocess"
+```
+
+The loader will automatically pick up `{instance_id}_react_facts.json` and `{instance_id}_analysis.md` from this directory.
 
 Optional debug prompt capture:
 
@@ -692,6 +858,9 @@ jq -r 'select(.event=="proposal_critic_validation") | .valid' <oracle_triad_logs
   - evaluation/benchmarks/swe_bench_optimized/ORACLE_TRIAD_MODULE_REPORT.md
   - evaluation/benchmarks/swe_bench_optimized/run_infer_oracle_triad.py
   - openhands/agenthub/oracle_triad_codeact_agent/oracle_triad_codeact_agent.py
+  - openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py (ReactFactTracker class)
+- React facts JSON format reference:
+  - evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/preprocess/django__django-12663_react_facts.json
 - Representative logs:
   - <path to oracle_triad_logs/instance.jsonl>
 ```

@@ -107,7 +107,13 @@ elif os.path.exists(openhands_remote_report_jsonl):
             instance_id = data['instance_id']
             eval_instance_ids.add(instance_id)
             n_eval_instances += 1
-            instance_id_to_status[instance_id] = data['test_result']['report']
+            instance_id_to_status[instance_id] = data['test_result'].get('report', {
+                'empty_generation': False,
+                'resolved': False,
+                'failed_apply_patch': False,
+                'error_eval': True,
+                'test_timeout': False,
+            })
     print(f'Total instances in eval report: {n_eval_instances}')
 
     # Verify no duplicates
