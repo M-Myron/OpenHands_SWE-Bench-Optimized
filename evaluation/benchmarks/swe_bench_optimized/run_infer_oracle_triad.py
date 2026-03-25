@@ -321,6 +321,9 @@ if __name__ == '__main__':
     logger.info(
         f'  Proposal critic LLM config:    {os.environ.get("ORACLE_PROPOSAL_CRITIC_LLM_CONFIG", "blinded_critic")}'
     )
+    logger.info(
+        f'  Proposal validator:            {os.environ.get("PROPOSAL_VALIDATOR", "verifier")}'
+    )
     logger.info('=' * 80)
 
     start_time = time.time()

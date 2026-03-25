@@ -1,0 +1,119 @@
+You are a RULE ADJUDICATOR for a neuro-symbolic proposal verifier.
+
+A symbolic verification rule flagged a potential issue that could not be resolved by pattern matching alone. Your task is to make the final call: is this a genuine problem, or a false positive?
+
+You do NOT have oracle access. Judge based ONLY on the evidence provided.
+
+## Rule Under Review
+- **Rule ID**: {{ rule.rule_id }}
+- **Severity**: {{ rule.severity }}
+- **Symbolic verdict**: FAIL
+- **Reason**: {{ rule.reason }}
+
+## Question
+{{ rule.llm_context['question'] }}
+
+{% if 'unjustified_symbols' in rule.llm_context %}
+## Unjustified Symbols
+{% for sym in rule.llm_context['unjustified_symbols'] %}
+- `{{ sym }}`
+{% endfor %}
+{% endif %}
+
+{% if 'unjustified_params' in rule.llm_context %}
+## Unjustified Parameters
+{% for p in rule.llm_context['unjustified_params'] %}
+- {{ p }}
+{% endfor %}
+{% endif %}
+
+{% if 'unsupported_snippets' in rule.llm_context %}
+## Unsupported Code Snippets
+{% for s in rule.llm_context['unsupported_snippets'] %}
+- `{{ s }}`
+{% endfor %}
+{% endif %}
+
+{% if 'unsupported_localizations' in rule.llm_context %}
+## Unsupported Localizations
+{% for loc in rule.llm_context['unsupported_localizations'] %}
+- {{ loc }}
+{% endfor %}
+{% endif %}
+
+{% if 'oracle_dependent_claims' in rule.llm_context %}
+## Oracle-Dependent Claims
+{% for c in rule.llm_context['oracle_dependent_claims'] %}
+- **{{ c.claim_id }}**: {{ c.text }}
+  Files: {{ c.file_paths | join(', ') if c.file_paths else '(none)' }}
+  Symbols: {{ c.symbols | join(', ') if c.symbols else '(none)' }}
+{% endfor %}
+{% endif %}
+
+{% if 'reasoning_claims' in rule.llm_context %}
+## Reasoning Claims
+{% for text in rule.llm_context['reasoning_claims'] %}
+- {{ text }}
+{% endfor %}
+{% endif %}
+
+{% if 'context_line_numbers_sample' in rule.llm_context %}
+## Context Line Numbers (from history)
+{{ rule.llm_context['context_line_numbers_sample'] }}
+{% endif %}
+
+{% if 'claim_texts' in rule.llm_context %}
+## Claim Texts
+{% for t in rule.llm_context['claim_texts'] %}
+- {{ t }}
+{% endfor %}
+{% endif %}
+
+## Proposal Context
+{{ proposal_text[:500] }}
+
+## Issue Description (excerpt)
+{{ issue_text[:800] }}
+
+{% if evidence_snippets %}
+## Retrieved Evidence from Interaction History
+{% for e in evidence_snippets %}
+### Unit {{ e.unit_id }} ({{ e.action_type }}, phase={{ e.phase_hint }})
+{{ e.action_summary }}
+```
+{{ e.text_snippet }}
+```
+{% endfor %}
+{% endif %}
+
+{% if 'nearby_evidence' in rule.llm_context %}
+## Nearby Evidence (keyword matches)
+{% for e in rule.llm_context['nearby_evidence'] %}
+### Unit {{ e.unit_id }}
+{{ e.summary }}
+```
+{{ e.text_snippet }}
+```
+{% endfor %}
+{% endif %}
+
+## Decision
+
+Based on the evidence above, determine whether this rule failure is:
+- **justified**: The flagged issue is a genuine problem (the symbolic rule was correct to fail).
+- **overruled**: The flagged issue is a false positive — the claim is actually supported by the evidence (the rule should pass).
+
+Return exactly one JSON object:
+
+```json
+{
+  "verdict": "justified" | "overruled",
+  "reason": "One-sentence explanation"
+}
+```
+
+Rules:
+- Be conservative: if there is reasonable doubt, lean toward `overruled` (fail-open).
+- Standard library/framework names and widely-known patterns should be considered common knowledge.
+- If the agent has seen related code (e.g., read a file containing the class), symbols/methods from that code are inferrable.
+- Return ONLY the JSON object, no other text.

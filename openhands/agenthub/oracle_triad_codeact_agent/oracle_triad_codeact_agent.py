@@ -6,6 +6,9 @@ import re
 from typing import TYPE_CHECKING
 
 from openhands.agenthub.codeact_agent.codeact_agent import CodeActAgent
+from openhands.agenthub.oracle_triad_codeact_agent.history_memory import (
+    StructuredHistoryMemory,
+)
 from openhands.agenthub.oracle_triad_codeact_agent.oracle_planner import (
     OraclePlanner,
     PlannerDecision,
@@ -14,6 +17,10 @@ from openhands.agenthub.oracle_triad_codeact_agent.oracle_planner import (
 from openhands.agenthub.oracle_triad_codeact_agent.proposal_critic import (
     OracleProposalCritic,
     ProposalValidationResult,
+)
+from openhands.agenthub.oracle_triad_codeact_agent.verifier import (
+    HistoryGroundedVerifier,
+    VerificationVerdict,
 )
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.message import Message, TextContent
@@ -86,26 +93,48 @@ def _append_triage_entry(entry: dict) -> None:
 
 
 class OracleTriadCodeActAgent(CodeActAgent):
-    """Triad agent with blinded debugger, oracle planner, and blinded critic.
+    """Triad agent with blinded debugger, oracle planner, and proposal validator.
 
     Flow per step:
     1) Blinded debugger (primary agent LLM) generates N candidate responses.
     2) Oracle planner (oracle-aware LLM) inspects full interaction history and
        candidates, then either selects one candidate or proposes a revised
        response while still being non-leaky and history-grounded.
-    3) If planner proposes a revised response, blinded proposal critic validates
-       the proposal. On rejection, planner revises up to configured retries.
-    4) If planner/critic loop cannot produce an accepted proposal, fallback to
+    3) If planner proposes a revised response, the proposal validator checks it.
+       On rejection, planner revises up to configured retries.
+    4) If planner/validator loop cannot produce an accepted proposal, fallback to
        planner's best candidate.
+
+    The validator backend is selected via the ``PROPOSAL_VALIDATOR`` env var:
+
+    - ``verifier`` (default) — ``HistoryGroundedVerifier``: 4-stage neuro-symbolic
+      pipeline (claim extraction → retrieval → symbolic rules → verdict synthesis).
+    - ``critic`` — ``OracleProposalCritic``: legacy one-shot LLM critic.
+    - ``none`` — skip proposal validation entirely.
     """
 
     VERSION = '1.0'
+
+    # Accepted values for PROPOSAL_VALIDATOR env var
+    _VALID_VALIDATORS = ('verifier', 'critic', 'none')
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._oracle_planner: OraclePlanner | None = None
         self._proposal_critic: OracleProposalCritic | None = None
+        self._verifier: HistoryGroundedVerifier | None = None
         self._components_initialized = False
+
+        # Read validator selection ------------------------------------------
+        # PROPOSAL_VALIDATOR: 'verifier' | 'critic' | 'none'  (default: verifier)
+        # Legacy compat: USE_LEGACY_CRITIC=1 is equivalent to PROPOSAL_VALIDATOR=critic
+        raw = os.environ.get('PROPOSAL_VALIDATOR', '').strip().lower()
+        if raw and raw in self._VALID_VALIDATORS:
+            self._validator_mode: str = raw
+        elif os.environ.get('USE_LEGACY_CRITIC', '0') == '1':
+            self._validator_mode = 'critic'
+        else:
+            self._validator_mode = 'verifier'
 
         self.triad_log: list[dict] = []
 
@@ -212,35 +241,68 @@ class OracleTriadCodeActAgent(CodeActAgent):
                     self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
                 break
 
-            if self._proposal_critic is None:
+            if self._proposal_critic is None and self._verifier is None:
                 chosen_response = self._materialize_planner_proposal(
                     base_messages=params['messages'],
                     planner_proposal=decision.proposal_response_text,
                     state=state,
                 )
-                # Mark referenced facts as used on accepted proposal (no critic)
+                # Mark referenced facts as used on accepted proposal (no critic/verifier)
                 if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
                     self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
                 break
 
-            validation = self._proposal_critic.validate(
-                step_index=step_index,
-                history_text=full_history_text,
-                proposal_response_text=decision.proposal_response_text,
-                attempt=planner_attempt,
-                fact_preconditions=fact_preconditions if fact_preconditions else None,
-            )
+            # --- Validate proposal via verifier or legacy critic -----------
+            validation_valid = False
+            validation_feedback = ''
+            validation_reason = ''
 
-            critic_entry = {
-                'step_index': step_index,
-                'event': 'proposal_critic_validation',
-                'attempt': planner_attempt,
-                **validation.to_dict(),
-            }
-            self.triad_log.append(critic_entry)
-            _append_triage_entry(critic_entry)
+            if self._verifier is not None:
+                history_memory = StructuredHistoryMemory.from_events(state.history)
+                verdict = self._verifier.verify(
+                    step_index=step_index,
+                    proposal_text=decision.proposal_response_text,
+                    history_memory=history_memory,
+                    fact_preconditions=fact_preconditions if fact_preconditions else None,
+                    attempt=planner_attempt,
+                )
 
-            if validation.valid:
+                verifier_entry = {
+                    'step_index': step_index,
+                    'event': 'verifier_verdict',
+                    'attempt': planner_attempt,
+                    **verdict.to_dict(),
+                }
+                self.triad_log.append(verifier_entry)
+                _append_triage_entry(verifier_entry)
+
+                validation_valid = verdict.valid
+                validation_feedback = verdict.feedback_message
+                validation_reason = verdict.reason
+
+            elif self._proposal_critic is not None:
+                validation = self._proposal_critic.validate(
+                    step_index=step_index,
+                    history_text=full_history_text,
+                    proposal_response_text=decision.proposal_response_text,
+                    attempt=planner_attempt,
+                    fact_preconditions=fact_preconditions if fact_preconditions else None,
+                )
+
+                critic_entry = {
+                    'step_index': step_index,
+                    'event': 'proposal_critic_validation',
+                    'attempt': planner_attempt,
+                    **validation.to_dict(),
+                }
+                self.triad_log.append(critic_entry)
+                _append_triage_entry(critic_entry)
+
+                validation_valid = validation.valid
+                validation_feedback = validation.feedback_message or validation.reason
+                validation_reason = validation.reason
+
+            if validation_valid:
                 chosen_response = self._materialize_planner_proposal(
                     base_messages=params['messages'],
                     planner_proposal=decision.proposal_response_text,
@@ -252,7 +314,7 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 break
 
             if planner_attempt < self._planner_max_retries:
-                planner_feedback = validation.feedback_message or validation.reason
+                planner_feedback = validation_feedback or validation_reason
                 continue
 
             logger.warning(
@@ -307,9 +369,36 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 tool_descriptions=tool_descriptions,
                 react_fact_tracker=react_fact_tracker,
             )
-            self._proposal_critic = OracleProposalCritic.from_env(
-                issue_text=public_issue_text,
-            )
+
+            # ---- initialise selected proposal validator ------------------
+            if self._validator_mode == 'critic':
+                self._proposal_critic = OracleProposalCritic.from_env(
+                    issue_text=public_issue_text,
+                )
+                logger.info(
+                    '[OracleTriadCodeActAgent] Proposal validator: OracleProposalCritic (legacy).'
+                )
+            elif self._validator_mode == 'verifier':
+                self._verifier = HistoryGroundedVerifier.from_env(
+                    issue_text=public_issue_text,
+                )
+                if self._verifier is None:
+                    logger.warning(
+                        '[OracleTriadCodeActAgent] Verifier init returned None; '
+                        'falling back to OracleProposalCritic.'
+                    )
+                    self._proposal_critic = OracleProposalCritic.from_env(
+                        issue_text=public_issue_text,
+                    )
+                else:
+                    logger.info(
+                        '[OracleTriadCodeActAgent] Proposal validator: HistoryGroundedVerifier.'
+                    )
+            else:
+                # 'none' — no validation
+                logger.info(
+                    '[OracleTriadCodeActAgent] Proposal validator: none (validation disabled).'
+                )
         except Exception as exc:
             logger.warning(
                 '[OracleTriadCodeActAgent] Failed to initialize planner/critic components: '
@@ -317,6 +406,7 @@ class OracleTriadCodeActAgent(CodeActAgent):
             )
             self._oracle_planner = None
             self._proposal_critic = None
+            self._verifier = None
 
     def _plan_next_response(
         self,
@@ -605,40 +695,25 @@ class OracleTriadCodeActAgent(CodeActAgent):
             if isinstance(event, MessageAction) and event.source == 'user':
                 user_messages.append((i, event.content))
 
-        index_lines: list[str] = ['=== SESSION INDEX (full history) ===']
-        if system_messages or user_messages:
-            index_lines.append('Base instruction events (hard requirements):')
-            if system_messages:
-                system_idx, system_content = system_messages[0]
-                index_lines.append(
-                    f'  - History Event {system_idx} OPENHANDS SYSTEM MESSAGE:'
-                )
-                for line in system_content.splitlines() or ['']:
-                    index_lines.append(f'      {line}')
-            if user_messages:
-                user_idx, user_content = user_messages[0]
-                user_content = OracleTriadCodeActAgent._strip_issue_description_block(
-                    user_content
-                )
-                index_lines.append(
-                    f'  - History Event {user_idx} USER MESSAGE (SWE-bench workflow):'
-                )
-                for line in user_content.splitlines() or ['']:
-                    index_lines.append(f'      {line}')
+        index_lines: list[str] = ['=== SESSION SUMMARY ===']
+        if system_messages:
+            index_lines.append(f'  - Event 0: OpenHands system instruction (debugger capabilities)')
+        if user_messages:
+            index_lines.append(f'  - Event 1: SWE-bench task + 8-phase workflow (issue description provided separately)')
         if files_read:
-            index_lines.append('Files READ this session:')
+            index_lines.append('Files read:')
             for path in files_read:
                 index_lines.append(f'  - {path}')
         if files_edited:
-            index_lines.append('Files EDITED this session:')
+            index_lines.append('Files edited:')
             for path in files_edited:
                 index_lines.append(f'  - {path}')
         if commands_run:
-            index_lines.append('Commands RUN this session:')
+            index_lines.append('Commands run:')
             for command in commands_run:
                 index_lines.append(f'  - {command}')
 
-        index_lines.append('=== END SESSION INDEX ===')
+        index_lines.append('=== END SESSION SUMMARY ===')
         index_lines.append('')
 
         lines: list[str] = []
