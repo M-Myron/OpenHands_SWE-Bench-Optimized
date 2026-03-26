@@ -92,19 +92,42 @@ elif os.path.exists(openhands_remote_report_jsonl):
 
     # Count instances in original file
     n_instances = 0
+    n_corrupted_input = 0
     with open(args.input_file, 'r') as f:
-        for line in tqdm(f, desc='Counting instances in original file'):
-            data = json.loads(line)
+        for ln, line in enumerate(tqdm(f, desc='Counting instances in original file'), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as e:
+                n_corrupted_input += 1
+                print(f'WARNING: Skipping corrupted JSON on line {ln} of input file: {e}')
+                continue
             instance_ids.add(data['instance_id'])
             n_instances += 1
+    if n_corrupted_input:
+        print(f'WARNING: Skipped {n_corrupted_input} corrupted line(s) in input file.')
     print(f'Total instances in original file: {n_instances}')
 
     # Process eval report
     n_eval_instances = 0
+    n_corrupted_eval = 0
     with open(openhands_remote_report_jsonl, 'r') as f:
-        for line in tqdm(f, desc='Processing eval report'):
-            data = json.loads(line)
+        for ln, line in enumerate(tqdm(f, desc='Processing eval report'), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as e:
+                n_corrupted_eval += 1
+                print(f'WARNING: Skipping corrupted JSON on line {ln} of eval report: {e}')
+                continue
             instance_id = data['instance_id']
+            if instance_id in eval_instance_ids:
+                print(f'WARNING: Duplicate instance_id {instance_id!r} on line {ln} of eval report; keeping first.')
+                continue
             eval_instance_ids.add(instance_id)
             n_eval_instances += 1
             instance_id_to_status[instance_id] = data['test_result'].get('report', {
@@ -114,14 +137,13 @@ elif os.path.exists(openhands_remote_report_jsonl):
                 'error_eval': True,
                 'test_timeout': False,
             })
+    if n_corrupted_eval:
+        print(f'WARNING: Skipped {n_corrupted_eval} corrupted line(s) in eval report.')
     print(f'Total instances in eval report: {n_eval_instances}')
 
     # Verify no duplicates
     assert len(instance_ids) == n_instances, (
         'Duplicate instance ids found in original output'
-    )
-    assert len(eval_instance_ids) == n_eval_instances, (
-        'Duplicate instance ids found in eval report'
     )
 
     # Initialize counters
@@ -136,8 +158,15 @@ elif os.path.exists(openhands_remote_report_jsonl):
 
     # Process original file and categorize instances
     with open(args.input_file, 'r') as f:
-        for line in f:
-            data = json.loads(line)
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f'WARNING: Skipping corrupted JSON on line {ln} of input file: {e}')
+                continue
             instance_id = data['instance_id']
             report = instance_id_to_status[instance_id]
 
@@ -210,7 +239,13 @@ else:
 needs_update = False
 with open(args.input_file, 'r') as infile:
     for line in tqdm(infile, desc='Checking for changes'):
-        data = json.loads(line)
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
         instance_id = data['instance_id']
         current_report = data.get('report', {})
         new_report = instance_id_to_status[
@@ -238,8 +273,15 @@ with (
     open(args.input_file + '.bak', 'r') as infile,
     open(args.input_file, 'w') as outfile,
 ):
-    for line in tqdm(infile, desc='Updating output file'):
-        data = json.loads(line)
+    for ln, line in enumerate(tqdm(infile, desc='Updating output file'), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f'WARNING: Dropping corrupted JSON on line {ln} during update: {e}')
+            continue
         instance_id = data['instance_id']
         data['report'] = instance_id_to_status[instance_id]
         outfile.write(json.dumps(data) + '\n')

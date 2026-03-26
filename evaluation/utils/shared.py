@@ -231,23 +231,54 @@ def prepare_dataset(
     logger.info(f'Writing evaluation output to {output_file}')
     finished_ids: set[str] = set()
     if os.path.exists(output_file):
+        good_lines: list[str] = []
+        needs_repair = False
         with open(output_file, 'r') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
-                    # Skip empty lines - they will be reprocessed
+                    needs_repair = True  # drop blank lines on repair
                     continue
                 try:
                     data = json.loads(line)
-                    finished_ids.add(str(data[id_column]))
+                    iid = str(data[id_column])
+                    if iid in finished_ids:
+                        logger.warning(
+                            f'Found duplicate instance_id {iid!r} on line {line_num} in {output_file}. '
+                            'Keeping only the first occurrence.'
+                        )
+                        needs_repair = True
+                    else:
+                        finished_ids.add(iid)
+                        good_lines.append(line)
                 except json.JSONDecodeError as e:
-                    # Corrupted JSON line - will be reprocessed
+                    needs_repair = True
                     logger.warning(
                         f'Found corrupted JSON on line {line_num} in {output_file}: {e}'
                     )
                     logger.warning(f'Corrupted line content: {line[:200]}...')
-                    logger.warning('This instance will be reprocessed.')
-                    continue
+                    logger.warning(
+                        'Dropping corrupted line. '
+                        'The instance will be reprocessed if it is present in the input.'
+                    )
+        if needs_repair:
+            backup = output_file + '.bak'
+            import shutil
+            shutil.copy2(output_file, backup)
+            logger.warning(
+                f'Repairing {output_file} '
+                f'(backup saved to {backup}). '
+                f'Keeping {len(good_lines)} valid lines.'
+            )
+            tmp = output_file + '.tmp'
+            with open(tmp, 'w') as f:
+                for l in good_lines:
+                    f.write(l + '\n')
+            os.replace(tmp, output_file)
+            # Remove instances that were dropped so they get reprocessed
+            finished_ids = set(
+                json.loads(l)[id_column] for l in good_lines
+            )
         logger.warning(
             f'\nOutput file {output_file} already exists. Loaded {len(finished_ids)} finished instances.'
         )
@@ -321,8 +352,10 @@ def update_progress(
     logger.info(
         f'Finished evaluation for instance {result.instance_id}: {str(result.test_result)[:300]}...\n'
     )
-    output_fp.write(result.model_dump_json() + '\n')
-    output_fp.flush()
+    # Use os.write() for a single syscall – more atomic than buffered write+flush,
+    # reducing the chance of a truncated line if the process is killed mid-write.
+    line = (result.model_dump_json() + '\n').encode()
+    os.write(output_fp.fileno(), line)
 
 
 def assert_and_raise(condition: bool, msg: str):

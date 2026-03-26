@@ -527,7 +527,20 @@ if __name__ == '__main__':
     )
 
     # Load evaluated predictions & print number of resolved predictions
-    evaluated_predictions = pd.read_json(output_file, lines=True)
+    # Use line-by-line loading to handle corrupted JSON lines gracefully
+    _records = []
+    with open(output_file) as _f:
+        for _ln, _line in enumerate(_f, 1):
+            _line = _line.strip()
+            if not _line:
+                continue
+            try:
+                _records.append(json.loads(_line))
+            except json.JSONDecodeError as _e:
+                logger.warning(
+                    f'Skipping corrupted JSON on line {_ln} in {output_file}: {_e}'
+                )
+    evaluated_predictions = pd.DataFrame(_records)
     fields = ['resolved', 'failed_apply_patch', 'error_eval', 'empty_generation']
 
     def count_report_field(row, field):

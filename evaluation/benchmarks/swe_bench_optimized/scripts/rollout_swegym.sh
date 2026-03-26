@@ -72,31 +72,31 @@ function run_eval() {
   local eval_note=$1
   local n_runs=$2
   
-  # # Start periodic Docker cleanup in background (only for local docker runtime)
-  # if [ "$RUNTIME" = "docker" ]; then
-  #   (
-  #     while true; do
-  #       sleep 1800  # Every 30 minutes
-  #       echo "### Running periodic Docker cleanup during evaluation... ###"
-  #       # Remove stopped containers
-  #       docker ps -q --filter "name=openhands-runtime-" --filter "status=exited" | xargs -r docker rm 2>/dev/null || true
-  #       # Remove SWE-bench evaluation images
-  #       docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
-  #       # Prune dangling images and build cache
-  #       docker image prune -f 2>/dev/null || true
-  #       docker builder prune -f --filter "until=30m" 2>/dev/null || true
-  #       # Show current usage
-  #       echo "Current Docker usage:"
-  #       docker system df
-  #       echo "Running containers: $(docker ps -q | wc -l)"
-  #       echo "Total images: $(docker images -q | wc -l)"
-  #     done
-  #   ) &
-  #   CLEANUP_PID=$!
-  #   
-  #   # Set up trap to kill cleanup process on script exit or interruption
-  #   trap "kill $CLEANUP_PID 2>/dev/null || true; echo 'Cleanup process stopped'" EXIT INT TERM
-  # fi
+  # Start periodic Docker cleanup in background (only for local docker runtime)
+  if [ "$RUNTIME" = "docker" ]; then
+    (
+      while true; do
+        sleep 1800  # Every 30 minutes
+        echo "### Running periodic Docker cleanup during evaluation... ###"
+        # Remove stopped containers
+        docker ps -q --filter "name=openhands-runtime-" --filter "status=exited" | xargs -r docker rm 2>/dev/null || true
+        # Remove SWE-bench evaluation images
+        docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "^(us-central1-docker\.pkg\.dev/evaluation-092424/swe-bench-images|docker\.io/xingyaoww/|mmr1115/openhands-runtime)" | xargs -r docker rmi -f 2>/dev/null || true
+        # Prune dangling images and build cache
+        docker image prune -f 2>/dev/null || true
+        docker builder prune -f --filter "until=30m" 2>/dev/null || true
+        # Show current usage
+        echo "Current Docker usage:"
+        docker system df
+        echo "Running containers: $(docker ps -q | wc -l)"
+        echo "Total images: $(docker images -q | wc -l)"
+      done
+    ) &
+    CLEANUP_PID=$!
+    
+    # Set up trap to kill cleanup process on script exit or interruption
+    trap "kill $CLEANUP_PID 2>/dev/null || true; echo 'Cleanup process stopped'" EXIT INT TERM
+  fi
   
   COMMAND="poetry run python evaluation/benchmarks/swe_bench_optimized/run_infer.py \
     --agent-cls CodeActAgent \
