@@ -430,10 +430,30 @@ class SymbolicRuleEngine:
         workflow_claims: list[Claim],
         all_claims: list[Claim],
     ) -> bool:
-        verification_kws = ('verif', 'run test', 'pytest', 'check fix')
+        # Strong signals: explicit testing/verification phase keywords
+        strong_kws = ('run test', 'pytest', 'check fix', 'phase 7',
+                      'verification phase', 'run the test', 'execute test')
         for c in workflow_claims + all_claims:
             text_lower = c.text.lower()
-            if any(kw in text_lower for kw in verification_kws):
+            if any(kw in text_lower for kw in strong_kws):
+                return True
+
+        # Weak signal: 'verif' substring — only trigger for workflow claims
+        # or action claims that look like test execution, NOT for reasoning
+        # or localization claims where "verified" means "confirmed/checked".
+        weak_kws = ('verif',)
+        for c in workflow_claims:
+            text_lower = c.text.lower()
+            if any(kw in text_lower for kw in weak_kws):
+                return True
+        # For non-workflow claims, require co-occurrence with test-like terms
+        test_context = ('test', 'assert', 'expect', 'pass', 'fail', 'suite')
+        for c in all_claims:
+            if c.claim_type in ('reasoning', 'localization'):
+                continue  # Skip — "verified" in analysis is exploratory
+            text_lower = c.text.lower()
+            if (any(kw in text_lower for kw in weak_kws)
+                    and any(t in text_lower for t in test_context)):
                 return True
         return False
 
@@ -747,6 +767,22 @@ class SymbolicRuleEngine:
         for m in re.finditer(r'\blines?\s+(\d+)', all_text, re.IGNORECASE):
             try:
                 context_line_nums.add(int(m.group(1)))
+            except ValueError:
+                pass
+        # GitHub URL line fragments: #L235, #L235-L236, #L235-236
+        for m in re.finditer(r'#L(\d+)(?:-L?(\d+))?', all_text):
+            try:
+                context_line_nums.add(int(m.group(1)))
+                if m.group(2):
+                    context_line_nums.add(int(m.group(2)))
+            except ValueError:
+                pass
+        # Diff hunk headers: @@ -233,5 +233,5 @@
+        for m in re.finditer(r'@@\s*-?(\d+)', all_text):
+            try:
+                n = int(m.group(1))
+                if 1 <= n <= 100000:
+                    context_line_nums.add(n)
             except ValueError:
                 pass
 
