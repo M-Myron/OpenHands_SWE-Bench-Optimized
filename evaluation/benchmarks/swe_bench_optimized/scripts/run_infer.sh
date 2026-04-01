@@ -15,6 +15,13 @@ N_RUNS=$9
 MODE=${10}
 # Optional: override output directory via 11th arg or EVAL_OUTPUT_DIR env var
 EVAL_OUTPUT_DIR=${11:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs"}}
+# Optional: limit concurrent runtime environment preparation during inference workers.
+# 0/empty means no limit (default behavior).
+PREPARE_ENV_MAX_WORKERS=${12:-${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-2}}
+
+if [ -n "$PREPARE_ENV_MAX_WORKERS" ] && [ "$PREPARE_ENV_MAX_WORKERS" -gt 0 ] 2>/dev/null; then
+    export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=$PREPARE_ENV_MAX_WORKERS
+fi
 
 
 if [ -z "$NUM_WORKERS" ]; then
@@ -77,6 +84,11 @@ echo "COMMIT_HASH: $COMMIT_HASH"
 echo "MODE: $MODE"
 echo "EVAL_CONDENSER: $EVAL_CONDENSER"
 echo "EVAL_OUTPUT_DIR: $EVAL_OUTPUT_DIR"
+if [ -n "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" ] && [ "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" -gt 0 ] 2>/dev/null; then
+    echo "OH_RUNTIME_PREPARE_MAX_CONCURRENCY: $OH_RUNTIME_PREPARE_MAX_CONCURRENCY"
+else
+    echo "OH_RUNTIME_PREPARE_MAX_CONCURRENCY: disabled"
+fi
 
 # Default to NOT use Hint
 if [ -z "$USE_HINT_TEXT" ]; then

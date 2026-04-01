@@ -104,10 +104,12 @@ def _try_reap_stale_prepare_slot(
     stale_seconds: float,
     lock_namespace: str,
 ) -> bool:
-    """Best-effort stale lock cleanup for crashed workers."""
-    if stale_seconds <= 0:
-        return False
+    """Best-effort stale lock cleanup for crashed workers.
 
+    A lock is considered stale and removed if:
+    1. The owning PID is no longer alive (process crashed/was killed), OR
+    2. The lock file is older than stale_seconds (fallback for unreadable PIDs)
+    """
     try:
         stat = os.stat(lock_file)
     except FileNotFoundError:
@@ -115,14 +117,22 @@ def _try_reap_stale_prepare_slot(
     except OSError:
         return False
 
-    age = time.time() - stat.st_mtime
-    if age < stale_seconds:
-        return False
-
     owner_pid = _read_lock_owner_pid(lock_file)
-    if owner_pid is not None and _is_pid_alive(owner_pid):
-        return False
 
+    # If we can read the PID, check if the process is still alive
+    if owner_pid is not None:
+        if _is_pid_alive(owner_pid):
+            return False
+        # PID is dead — reap immediately regardless of age
+    else:
+        # Can't read PID — fall back to age-based check
+        if stale_seconds <= 0:
+            return False
+        age = time.time() - stat.st_mtime
+        if age < stale_seconds:
+            return False
+
+    age = time.time() - stat.st_mtime
     try:
         os.remove(lock_file)
     except FileNotFoundError:
@@ -901,10 +911,20 @@ def _env_prepare_concurrency_slot():
     lock_dir = os.path.join(lock_root, lock_namespace)
     os.makedirs(lock_dir, exist_ok=True)
 
+    # Eagerly reap any stale locks left by dead processes from a previous run
+    for fname in os.listdir(lock_dir):
+        if fname.endswith('.lock'):
+            _try_reap_stale_prepare_slot(
+                os.path.join(lock_dir, fname),
+                stale_seconds=stale_lock_seconds,
+                lock_namespace=lock_namespace,
+            )
+
     slot_path = None
     pid = os.getpid()
     start_wait = time.time()
     last_wait_log = start_wait
+    wait_log_count = 0
 
     while slot_path is None:
         for slot_idx in range(max_slots):
@@ -957,6 +977,9 @@ def _env_prepare_concurrency_slot():
                     active_locks,
                 )
                 last_wait_log = now
+                wait_log_count += 1
+                # Log less frequently over time: 30s, 60s, 120s, 240s, ... (cap at 300s)
+                wait_log_seconds = min(wait_log_seconds * 2, 300)
 
             time.sleep(0.5)
 
