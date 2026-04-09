@@ -10,8 +10,11 @@
 1. [Quick Start](#1-quick-start)
 2. [Prerequisites](#2-prerequisites)
 3. [Configuration](#3-configuration)
-   - [config.toml Setup](#31-configtoml-setup)
-   - [Environment Variables](#32-environment-variables)
+   - [config.toml Setup (LLM endpoints)](#31-configtoml-setup-llm-endpoints)
+   - [YAML Config File (triad settings)](#32-yaml-config-file-triad-settings)
+   - [Environment Variable Overrides](#33-environment-variable-overrides)
+   - [Configuration Priority](#34-configuration-priority)
+   - [Stale Environment Variables](#35-stale-environment-variables)
 4. [Running Evaluations](#4-running-evaluations)
    - [Shell Launcher](#41-shell-launcher)
    - [Python Entry Point](#42-python-entry-point)
@@ -26,32 +29,27 @@
    - [Triad Log Format](#72-triad-log-format)
    - [Saved Prompts](#73-saved-prompts)
 8. [Debugging and Troubleshooting](#8-debugging-and-troubleshooting)
-9. [Advanced Configuration](#9-advanced-configuration)
+9. [Experiment Recipes](#9-experiment-recipes)
 
 ---
 
 ## 1. Quick Start
 
 ```bash
-# 1. Ensure config.toml has LLM sections (see §3.1)
-# 2. Run evaluation on a single instance
+# Minimal — uses all Python defaults (1 candidate, verifier, prompt saving on)
 bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
-  openai/zai-org/GLM-5-FP8 \
-  HEAD \
-  OracleTriadCodeActAgent \
-  1 \
-  100 \
-  1 \
-  princeton-nlp/SWE-bench_Verified \
-  test \
-  1
-```
+  llm.eval_glm5_fp8_t0 HEAD OracleTriadCodeActAgent 1 100 1
 
-This runs the Oracle Triad agent on the default test instance (`django__django-12663`) with:
-- 3 debugger candidates per step
-- 2 planner retries on validation failure
-- The `verifier` validation backend (4.5-stage neuro-symbolic pipeline)
-- Maximum 100 iterations
+# With a YAML config file for full control
+ORACLE_TRIAD_CONFIG=my_experiment.yaml \
+bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
+  llm.eval_glm5_fp8_t0 HEAD OracleTriadCodeActAgent 1 100 1
+
+# Override a single setting via env var (takes precedence over YAML)
+BLINDED_DEBUGGER_NUM_CANDIDATES=3 \
+bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
+  llm.eval_glm5_fp8_t0 HEAD
+```
 
 ---
 
@@ -67,9 +65,15 @@ This runs the Oracle Triad agent on the default test instance (`django__django-1
 
 ## 3. Configuration
 
-### 3.1 config.toml Setup
+The Oracle Triad has three configuration layers, applied in priority order:
 
-The Oracle Triad requires **three LLM configurations** in `config.toml`:
+```
+Explicit env var  >  YAML config file  >  Python defaults
+```
+
+### 3.1 config.toml Setup (LLM endpoints)
+
+The Oracle Triad requires **three LLM configurations** in `config.toml`. These control which models and endpoints are used — they are separate from the YAML config that controls agent behaviour.
 
 ```toml
 # Primary model — used by the Blinded Debugger
@@ -94,61 +98,152 @@ base_url = "https://your-endpoint/v1"
 temperature = 0.0
 ```
 
-**Notes:**
-- All three can use the same model endpoint; the information barrier is enforced by prompt design, not model separation.
-- The `oracle_planner` config is read by `ORACLE_PLANNER_LLM_CONFIG` env var (default: `oracle_planner`).
-- The `blinded_critic` config is read by `ORACLE_PROPOSAL_CRITIC_LLM_CONFIG` env var (default: `blinded_critic`).
+All three can use the same model endpoint; the information barrier is enforced by prompt design, not model separation.
 
-### 3.2 Environment Variables
+### 3.2 YAML Config File (triad settings)
 
-All env vars have sensible defaults. Override only when needed.
+All agent behaviour, oracle context visibility, and prompt template sections can be controlled from a single YAML config file. **The YAML config is optional** — when not provided, all defaults come from Python dataclasses in `triad_config.py`, not from any file.
 
-#### Candidate Generation
+To use a YAML config:
+
+```bash
+export ORACLE_TRIAD_CONFIG=/path/to/my_config.yaml
+```
+
+A fully-documented reference template is at: `openhands/agenthub/oracle_triad_codeact_agent/triad_config.default.yaml`
+
+This file is **never read automatically** — it's just a template to copy and edit. Only include the keys you want to change; missing keys fall back to the hardcoded Python defaults.
+
+The config has four sections:
+
+#### `oracle_context` — what the planner sees
+
+Controls which private oracle information is assembled into the planner prompt.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `include_golden_patch` | `true` | Show the ground-truth code fix diff |
+| `include_golden_test_patch` | `true` | Show the ground-truth test patch diff |
+| `include_issue_understanding` | `true` | Show structured issue understanding (bug description, trigger, rationale) |
+| `include_deep_analysis` | `true` | Show precomputed root-cause analysis markdown |
+| `include_react_facts` | `true` | Load and display the investigation graph (stage3/stage2/legacy) |
+
+#### `planner_prompt` — which template sections are rendered
+
+Controls which instructional sections appear in the planner prompt template.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `include_tool_descriptions` | `true` | Show available tool catalog (names, params, descriptions) |
+| `include_fact_usage_rules` | `true` | Show the "Complete investigation before implementation" rules |
+| `include_finalize_guidance` | `true` | Show "Proceed to Finalize" guidance when all facts are consumed |
+| `include_proposal_format` | `true` | Show proposal format instructions (REASONING + TOOL CALL) |
+| `include_workflow_guidelines` | `true` | Show recommended 7-phase debugging workflow |
+
+#### `agent` — runtime behaviour
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `num_candidates` | `1` | Blinded debugger candidates per step |
+| `planner_max_retries` | `2` | Planner revision retries on validation failure |
+| `planner_history_window` | `5` | Recent action steps shown to planner (`-1` = full history) |
+| `proposal_validator` | `verifier` | Validation backend: `verifier`, `critic`, or `none` |
+| `planner_llm_config` | `oracle_planner` | config.toml section name for planner LLM |
+| `critic_llm_config` | `blinded_critic` | config.toml section name for critic/verifier LLM |
+| `verifier_llm_config` | `""` | config.toml section for verifier (empty = use critic) |
+| `planner_json_parse_max_retries` | `3` | JSON parsing retries for planner response |
+| `critic_json_parse_max_retries` | `3` | JSON parsing retries for critic/verifier response |
+| `verifier_programmatic_only` | `false` | Skip LLM claim extraction, use regex only |
+| `verifier_extractor_json_retries` | `2` | LLM JSON parsing retries for claim extraction |
+
+#### `debug` — prompt saving
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `save_planner_prompts` | `true` | Save all planner prompts/responses to disk |
+| `save_critic_prompts` | `true` | Save all critic/verifier prompts/responses to disk |
+
+#### Example: minimal config file
+
+You only need to include the keys you want to change:
+
+```yaml
+# my_experiment.yaml — ablation without golden patches
+oracle_context:
+  include_golden_patch: false
+  include_golden_test_patch: false
+
+agent:
+  num_candidates: 3
+```
+
+### 3.3 Environment Variable Overrides
+
+Any setting from the YAML config can be overridden with an env var. This is useful for one-off changes without editing a file.
+
+| Env Var | YAML Equivalent |
+|---------|-----------------|
+| `BLINDED_DEBUGGER_NUM_CANDIDATES` | `agent.num_candidates` |
+| `ORACLE_PLANNER_MAX_RETRIES` | `agent.planner_max_retries` |
+| `ORACLE_PLANNER_HISTORY_WINDOW` | `agent.planner_history_window` |
+| `PROPOSAL_VALIDATOR` | `agent.proposal_validator` |
+| `ORACLE_PLANNER_LLM_CONFIG` | `agent.planner_llm_config` |
+| `ORACLE_PROPOSAL_CRITIC_LLM_CONFIG` | `agent.critic_llm_config` |
+| `VERIFIER_LLM_CONFIG` | `agent.verifier_llm_config` |
+| `VERIFIER_PROGRAMMATIC_ONLY` | `agent.verifier_programmatic_only` |
+| `ORACLE_PLANNER_SAVE_PROMPTS` | `debug.save_planner_prompts` |
+| `ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS` | `debug.save_critic_prompts` |
+
+**Vars without YAML equivalents** (always set via env vars or shell args):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BLINDED_DEBUGGER_NUM_CANDIDATES` | `3` | Number of debugger candidates per step. Higher values increase diversity but cost more LLM calls. Minimum: 1. |
+| `ORACLE_TRIAD_CONFIG` | (not set) | Path to YAML config file |
+| `ORACLE_PREPROCESS_DIR` | Auto-detect | Directory with react facts and analysis files |
+| `INSTANCE_IDS` | (all) | Comma-separated instance IDs to evaluate |
 
-#### Planner
+### 3.4 Configuration Priority
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ORACLE_PLANNER_LLM_CONFIG` | `oracle_planner` | LLM config section name in config.toml |
-| `ORACLE_PLANNER_MAX_RETRIES` | `2` | How many revision attempts on validation failure. Minimum: 0. |
-| `ORACLE_PLANNER_JSON_PARSE_MAX_RETRIES` | `3` | JSON response parsing retries |
+```
+1. Explicit env var  (e.g., BLINDED_DEBUGGER_NUM_CANDIDATES=3)
+       ↓ if not set
+2. YAML config file  (e.g., agent.num_candidates: 3 in ORACLE_TRIAD_CONFIG)
+       ↓ if not specified in YAML or no YAML file
+3. Python defaults   (hardcoded in triad_config.py dataclasses, e.g., num_candidates=1)
+```
 
-#### Validation
+The shell launcher only exports env vars the user explicitly set. If a var is unset, it is left for the Python-side `TriadConfig` to resolve from YAML or defaults.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PROPOSAL_VALIDATOR` | `verifier` | Validation backend. Options: `verifier` (4.5-stage), `critic` (one-shot), `none` |
-| `USE_LEGACY_CRITIC` | `0` | Set to `1` to force `PROPOSAL_VALIDATOR=critic` |
-| `ORACLE_PROPOSAL_CRITIC_LLM_CONFIG` | `blinded_critic` | LLM config for validator |
-| `ORACLE_PROPOSAL_CRITIC_JSON_PARSE_MAX_RETRIES` | `3` | JSON parsing retries |
+**Where defaults live:**
+- `ORACLE_PREPROCESS_DIR` — auto-detected by the shell script from dataset/split. Shows `(not set)` in the banner only if no preprocess directory exists on disk.
+- `ORACLE_TRIAD_CONFIG` — genuinely optional. When unset, Python returns hardcoded defaults. `(not set)` in the banner is normal and expected.
+- All other triad settings — hardcoded in Python dataclasses (`triad_config.py`). The `triad_config.default.yaml` file is a reference template, never auto-loaded.
 
-#### Verifier-Specific
+### 3.5 Stale Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VERIFIER_PROGRAMMATIC_ONLY` | `0` | Set to `1` to skip LLM-based claim extraction (use regex only) |
-| `VERIFIER_EXTRACTOR_JSON_RETRIES` | `2` | LLM JSON parsing retries for claim extraction |
-| `VERIFIER_LLM_CONFIG` | (uses critic config) | Override LLM config for verifier |
+Env vars from a previous shell session (e.g., `export BLINDED_DEBUGGER_NUM_CANDIDATES=3` run hours ago) persist silently and override both YAML config and Python defaults. The shell banner shows all active env var overrides so you can spot surprises:
 
-#### Data Paths
+```
+  Triad env var overrides (unset = YAML/default):
+    BLINDED_DEBUGGER_NUM_CANDIDATES=3    ← is this intentional or stale?
+    PROPOSAL_VALIDATOR=none
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ORACLE_PLANNER_CONTEXT_PATH` | (set per instance) | Path to oracle context JSON. Set automatically by evaluation runner. |
-| `ORACLE_PREPROCESS_DIR` | Auto-detect | Directory with `{instance_id}_react_facts.json` and `{instance_id}_analysis.md`. Auto-detected from dataset/split. |
+To guarantee a clean slate, use `TRIAD_CLEAN_ENV=1`:
 
-#### Debugging
+```bash
+# Clear all triad env vars, use only YAML config + Python defaults
+TRIAD_CLEAN_ENV=1 ORACLE_TRIAD_CONFIG=my.yaml \
+  bash run_oracle_triad_infer.sh llm.eval_glm5_fp8_t0 HEAD
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ORACLE_PLANNER_SAVE_PROMPTS` | `0` | Set to `1` to save all planner prompts/responses |
-| `ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS` | `0` | Set to `1` to save all validator prompts/responses |
-| `ORACLE_PLANNER_SAVE_PROMPTS_DIR` | (set per instance) | Output directory for planner prompts |
-| `ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS_DIR` | (set per instance) | Output directory for validator prompts |
+# Clear stale vars, then set one fresh override
+TRIAD_CLEAN_ENV=1 BLINDED_DEBUGGER_NUM_CANDIDATES=5 \
+  bash run_oracle_triad_infer.sh llm.eval_glm5_fp8_t0 HEAD
+```
+
+`TRIAD_CLEAN_ENV=1` unsets all triad-controlled env vars at the top of the script, before any other logic runs. Vars you set on the same command line (after `TRIAD_CLEAN_ENV=1`) are re-applied and take effect normally.
+
+**Best practice:** Use YAML config for persistent settings. Use inline env vars (on the command line) for one-off overrides. Use `TRIAD_CLEAN_ENV=1` when unsure what's in your shell session.
 
 ---
 
@@ -170,31 +265,31 @@ bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh
 | `EVAL_LIMIT` | 4 | (all) | Number of instances to evaluate |
 | `MAX_ITER` | 5 | `100` | Maximum iterations per instance |
 | `NUM_WORKERS` | 6 | `1` | Parallel workers |
-| `DATASET` | 7 | `princeton-nlp/SWE-bench_Lite` | HuggingFace dataset identifier |
-| `SPLIT` | 8 | `test` | Dataset split |
+| `DATASET` | 7 | `SWE-Gym/SWE-Gym` | HuggingFace dataset identifier |
+| `SPLIT` | 8 | `train` | Dataset split |
 | `N_RUNS` | 9 | `1` | Runs per instance |
 
-**Example — Full SWE-bench Verified evaluation:**
+**Example — with YAML config:**
 
 ```bash
+ORACLE_TRIAD_CONFIG=configs/no_patches.yaml \
 bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
-  openai/zai-org/GLM-5-FP8 \
-  HEAD \
-  OracleTriadCodeActAgent \
-  500 \
-  100 \
-  4 \
-  princeton-nlp/SWE-bench_Verified \
-  test \
-  1
+  llm.eval_glm5_fp8_t0 HEAD OracleTriadCodeActAgent 10 100 2
+```
+
+**Example — with env var overrides (no YAML):**
+
+```bash
+BLINDED_DEBUGGER_NUM_CANDIDATES=3 PROPOSAL_VALIDATOR=none \
+bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
+  llm.eval_glm5_fp8_t0 HEAD
 ```
 
 The shell script:
-1. Auto-detects `ORACLE_PREPROCESS_DIR` from dataset/split
-2. Sets default env vars for candidates, retries, validator mode
-3. Hardcodes prompt saving (`ORACLE_PLANNER_SAVE_PROMPTS=1`)
-4. Starts a background Docker cleanup loop (prunes every 30 minutes)
-5. Calls the Python evaluation runner
+1. Auto-detects `ORACLE_PREPROCESS_DIR` from dataset/split (tries `swegym_v5`, `swegym_v3`, then bare preprocess dir)
+2. Only exports env vars the user explicitly set — unset vars are left for Python `TriadConfig` to resolve from YAML or defaults
+3. Starts a background Docker cleanup loop (prunes every 30 minutes)
+4. Calls the Python evaluation runner
 
 ### 4.2 Python Entry Point
 
@@ -219,17 +314,18 @@ poetry run python evaluation/benchmarks/swe_bench_optimized/run_infer_oracle_tri
 For development and debugging:
 
 ```bash
-# Set env vars for single-instance testing
-export BLINDED_DEBUGGER_NUM_CANDIDATES=3
-export ORACLE_PLANNER_MAX_RETRIES=2
-export PROPOSAL_VALIDATOR=verifier
-export ORACLE_PLANNER_SAVE_PROMPTS=1
-export ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS=1
-export INSTANCE_IDS=django__django-12663
-
+# Option A: env vars
+BLINDED_DEBUGGER_NUM_CANDIDATES=3 \
+INSTANCE_IDS=django__django-12663 \
 bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
-  openai/zai-org/GLM-5-FP8 HEAD OracleTriadCodeActAgent 1 100 1 \
-  princeton-nlp/SWE-bench_Verified test 1
+  llm.eval_glm5_fp8_t0 HEAD OracleTriadCodeActAgent 1 100 1 \
+  princeton-nlp/SWE-bench_Verified test+
+
+# Option B: YAML config
+ORACLE_TRIAD_CONFIG=configs/debug.yaml \
+INSTANCE_IDS=django__django-12663 \
+bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
+  llm.eval_glm5_fp8_t0 HEAD
 ```
 
 ---
@@ -246,52 +342,143 @@ evaluation/evaluation_outputs/outputs/<dataset_slug>-<split>/preprocess/
 
 Where `<dataset_slug>` is the dataset path with `/` replaced by `__`.
 
-**Example:**
+Two directory layouts are supported:
+
+**New graph-based layout (swegym_v5):**
+```
+evaluation/evaluation_outputs/outputs/SWE-Gym__SWE-Gym-train/preprocess/swegym_v5/
+├── bokeh__bokeh-12779/
+│   ├── stage3_bridged.json          # Bridged investigation DAG (v5)
+│   ├── stage2_facts.json            # Stage-2 graph (v3, fallback)
+│   └── ...
+└── ...
+```
+
+**Legacy flat layout:**
 ```
 evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/preprocess/
 ├── django__django-12663_react_facts.json
 ├── django__django-12663_analysis.md
-├── astropy__astropy-14995_react_facts.json
-├── astropy__astropy-14995_analysis.md
 └── ...
 ```
 
+The loader tries these paths in order:
+1. `{preprocess_dir}/{instance_id}/stage3_bridged.json` (v5 bridged graph)
+2. `{preprocess_dir}/{instance_id}/stage2_facts.json` (v3 graph)
+3. `{preprocess_dir}/{instance_id}_react_facts.json` (legacy flat)
+
+The shell launcher auto-detects the `swegym_v5` or `swegym_v3` subdirectory if present.
+
 ### 5.2 React Facts Format
 
-Each `{instance_id}_react_facts.json` file follows this schema:
+Two formats are supported:
+
+#### Bridged graph format (recommended — `stage3_bridged.json`)
+
+A DAG of investigation nodes with typed categories, single evidence dict per node, motivation fields, and bridge facts:
 
 ```json
 {
-  "instance_id": "django__django-12663",
-  "stages": [
+  "instance_id": "bokeh__bokeh-12779",
+  "intention_groups": [...],
+  "graph": [
     {
-      "stage_name": "Initial Exploration",
-      "steps": [
-        {
-          "goal": "Understand the issue context",
-          "fact": "Read the django/db/models/lookups.py file to understand Lookup class",
-          "preconditions": [],
-          "reasoning": "The issue mentions Lookup subclass, we need to understand the base class",
-          "action": "[TOOL CALL] read_file({\"path\": \"django/db/models/lookups.py\", \"view_range\": [1, 50]})",
-          "observation": "Lookup class inherits from Expression mixin"
-        },
-        ...
-      ]
+      "id": "f1",
+      "category": "fact",
+      "kind": "requirement_fact",
+      "is_root": true,
+      "grounding": "problem_rooted",
+      "statement": "The problem statement reports a ResourceWarning...",
+      "motivation": "The problem statement is the primary input for understanding what is broken.",
+      "preconditions": [],
+      "evidence": {
+        "action": "[view] problem_statement",
+        "observation": "The issue reports ResourceWarning at directory.py:126..."
+      }
     },
     {
-      "stage_name": "Root Cause Analysis",
-      "steps": [...]
+      "id": "f2",
+      "category": "fact",
+      "kind": "codebase_fact",
+      "is_root": false,
+      "grounding": "problem_rooted",
+      "statement": "In directory.py line 126, open(init_py).read() creates an unclosed file...",
+      "motivation": "Viewing the reported location confirms the unclosed file pattern.",
+      "preconditions": ["f1"],
+      "evidence": {
+        "action": "[view] src/bokeh/application/handlers/directory.py 115-132",
+        "observation": "Line 126: open() return value used inline without closing."
+      }
     },
-    ...
-  ]
+    {
+      "id": "b1",
+      "category": "bridge_fact",
+      "discovery_type": "proactive_exploration",
+      "kind": "codebase_fact",
+      "statement": "Developer scans other example scripts and discovers scipy.misc.ascent()...",
+      "preconditions": ["f10"],
+      "evidence": {...}
+    },
+    {
+      "id": "e1",
+      "category": "edit_step",
+      "title": "Fix unclosed file in DirectoryHandler.__init__",
+      "intention_group": "g1",
+      "file": "src/bokeh/application/handlers/directory.py",
+      "preconditions": ["p1"],
+      "evidence": {...}
+    }
+  ],
+  "bridge_summary": {
+    "total_non_problem_rooted": 6,
+    "bridged": 3,
+    "irreducible": 3,
+    "bridges": [...],
+    "irreducible_facts": [...]
+  },
+  "derivation_frontier": ["f1", "f2", ...]
 }
 ```
 
-**Key fields:**
-- `stages[].stage_name`: Investigation phase (e.g., "Initial Exploration", "Root Cause Analysis", "Fix Implementation")
-- `steps[].preconditions`: List of history state requirements that must hold before this step is applicable. Used by the validator to check fact grounding.
-- `steps[].action`: The concrete tool call. Used by the planner as a reference for proposal generation.
-- `steps[].reasoning`: Why this step is appropriate. Aids planner in generating well-justified proposals.
+**Node categories:** `fact`, `bridge_fact`, `organizational_fact`, `plan_fact`, `edit_step`, `validation_step`
+
+**Key properties:**
+- `preconditions`: List of **node IDs**. A node is only shown to the planner when all precondition nodes are fully consumed.
+- `evidence`: **Single dict** `{action, observation}` (v5) — normalized internally to a 1-element list.
+- `is_root`: True for facts with no preconditions (entry points to the DAG).
+- `grounding`: `problem_rooted`, `bridged`, or `non_problem_rooted`.
+- `motivation`: Why this fact was investigated.
+- `discovery_type` (bridge_fact only): How the fact was discovered (`proactive_exploration`, `structural_browsing`).
+
+#### Stage-2 graph format (`stage2_facts.json`)
+
+Older DAG format with categories `trigger`/`base_fact` and evidence as an **array** of `{reasoning, action, observation}` dicts. Fully backward compatible — loaded and rendered identically.
+
+#### Legacy format (`_react_facts.json`)
+
+Flat stages with facts (backward compatible):
+
+```json
+{
+  "stages": [
+    {
+      "stage": "phase_3_exploration",
+      "goal": "Find the bug",
+      "facts": [
+        {
+          "fact": "The bug is in lookups.py",
+          "preconditions": ["Must have read the traceback"],
+          "reasoning_action_observation": {
+            "reasoning": "The traceback points to lookups.py",
+            "action": "read_file path=lookups.py",
+            "observation": "Found Lookup class"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
 
 ### 5.3 Deep Analysis Format
 
@@ -380,7 +567,7 @@ Each line in `<instance_id>.jsonl` is a JSON object with one of these event type
   "best_candidate_index": 1,
   "chosen_candidate_index": null,
   "proposal_response_text": "REASONING: The agent...\n[TOOL CALL] read_file(...)",
-  "referenced_fact_ids": ["stage1_2", "stage2_0"]
+  "referenced_fact_ids": ["f1", "f2", "b1"]
 }
 ```
 
@@ -420,10 +607,19 @@ Each line in `<instance_id>.jsonl` is a JSON object with one of these event type
 {
   "step_index": 5,
   "event": "react_fact_usage_summary",
-  "total_facts": 12,
-  "used_facts": 4,
-  "remaining_facts": 8,
-  "used_fact_ids": ["stage1_0", "stage1_2", "stage2_0", "stage2_1"]
+  "total_nodes": 45,
+  "fully_used_nodes": 5,
+  "partially_used_nodes": 1,
+  "not_used_nodes": 39,
+  "available_nodes": 9,
+  "blocked_nodes": 31,
+  "total_evidence": 53,
+  "used_evidence": 6,
+  "remaining_evidence": 47,
+  "total_facts": 45,
+  "used_facts": 5,
+  "remaining_facts": 40,
+  "used_fact_ids": ["t1", "t2", "t3", "t4", "t5"]
 }
 ```
 
@@ -471,8 +667,11 @@ echo $ORACLE_PREPROCESS_DIR
 ls $ORACLE_PREPROCESS_DIR/<instance_id>_react_facts.json
 ```
 
-The shell launcher auto-detects this from the dataset/split. If running the Python entry point directly, set it manually:
+The shell launcher auto-detects this from the dataset/split (including the `swegym_v3` subdirectory if present). If running the Python entry point directly, set it manually:
 ```bash
+# For graph-based facts (swegym_v3 layout — instance subdirectories):
+export ORACLE_PREPROCESS_DIR=evaluation/evaluation_outputs/outputs/SWE-Gym__SWE-Gym-train/preprocess/swegym_v3
+# For legacy flat layout:
 export ORACLE_PREPROCESS_DIR=evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/preprocess
 ```
 
@@ -500,7 +699,7 @@ cat oracle_triad_logs/<id>.jsonl | grep verifier_verdict | \
 
 # React fact consumption timeline
 cat oracle_triad_logs/<id>.jsonl | grep react_fact_usage | \
-  python -c "import sys,json; [print(f'step {json.loads(l)[\"step_index\"]}: {json.loads(l)[\"used_facts\"]}/{json.loads(l)[\"total_facts\"]}') for l in sys.stdin]"
+  python -c "import sys,json; [print(f'step {json.loads(l)[\"step_index\"]}: avail={json.loads(l).get(\"available_nodes\",\"?\")}, used={json.loads(l)[\"used_facts\"]}/{json.loads(l)[\"total_facts\"]}, blocked={json.loads(l).get(\"blocked_nodes\",\"?\")}') for l in sys.stdin]"
 ```
 
 ### 8.3 Enabling Verbose Logging
@@ -513,65 +712,117 @@ export LOG_LEVEL=DEBUG
 
 ---
 
-## 9. Advanced Configuration
+## 9. Experiment Recipes
 
-### 9.1 Using Different Models Per Component
+All recipes below use a YAML config file. Save the YAML content to a file and run with `ORACLE_TRIAD_CONFIG=filename.yaml`.
 
-```toml
-# Fast model for candidates
-[llm]
-model = "openai/gpt-4o-mini"
+### 9.1 Ablation: No Golden Patches
 
-# Stronger model for oracle planning
-[llm.oracle_planner]
-model = "openai/gpt-4o"
+Test whether the planner can still guide effectively without seeing the ground-truth fix.
 
-# Cost-efficient model for validation
-[llm.blinded_critic]
-model = "openai/gpt-4o-mini"
+```yaml
+# no_patches.yaml
+oracle_context:
+  include_golden_patch: false
+  include_golden_test_patch: false
 ```
 
-### 9.2 Tuning Candidate Count
+### 9.2 Ablation: Facts Only (No Patch, No Analysis)
 
-More candidates increase the chance of a good match but cost proportionally more LLM calls:
+Test the investigation graph in isolation.
 
-| `BLINDED_DEBUGGER_NUM_CANDIDATES` | Trade-off |
-|:-:|-----------|
-| 1 | Baseline — planner almost always proposes |
-| 3 | Default — good diversity/cost balance |
-| 5 | High diversity — useful for difficult instances |
+```yaml
+# facts_only.yaml
+oracle_context:
+  include_golden_patch: false
+  include_golden_test_patch: false
+  include_deep_analysis: false
+```
 
-### 9.3 Programmatic-Only Mode
+### 9.3 Ablation: Patch Only (No React Facts)
 
-For maximum speed (no LLM calls in verifier):
+Test planner with golden code fix but no investigation guidance.
+
+```yaml
+# patch_only.yaml
+oracle_context:
+  include_react_facts: false
+  include_deep_analysis: false
+```
+
+### 9.4 Fast Mode (No Verifier, Minimal Overhead)
+
+Maximum speed for initial development or stress testing.
+
+```yaml
+# fast.yaml
+agent:
+  num_candidates: 1
+  planner_max_retries: 1
+  proposal_validator: none
+debug:
+  save_planner_prompts: false
+  save_critic_prompts: false
+```
+
+### 9.5 High-Quality Mode (More Candidates, Full Verification)
+
+Maximum trajectory quality for final SFT data generation.
+
+```yaml
+# quality.yaml
+agent:
+  num_candidates: 3
+  planner_max_retries: 3
+  proposal_validator: verifier
+```
+
+### 9.6 Minimal Prompt (Strip Non-Essential Sections)
+
+Reduce prompt token count for smaller models.
+
+```yaml
+# minimal_prompt.yaml
+planner_prompt:
+  include_tool_descriptions: false
+  include_workflow_guidelines: false
+  include_proposal_format: false
+```
+
+### 9.7 Using Different Models Per Component
+
+Set different config.toml sections for each component:
+
+```yaml
+# multi_model.yaml
+agent:
+  planner_llm_config: oracle_planner_gpt4o  # strong model for planning
+  critic_llm_config: critic_gpt4o_mini       # cost-efficient for validation
+```
+
+Requires corresponding `[llm.oracle_planner_gpt4o]` and `[llm.critic_gpt4o_mini]` sections in `config.toml`.
+
+### 9.8 Programmatic-Only Verifier (No LLM in Verifier)
+
+For maximum verifier speed — regex claim extraction + deterministic rules only.
+
+```yaml
+# regex_verifier.yaml
+agent:
+  verifier_programmatic_only: true
+```
+
+### 9.9 Combining YAML + Env Var Overrides
+
+Use a base YAML config and override specific values per run:
 
 ```bash
-export VERIFIER_PROGRAMMATIC_ONLY=1
+# Base config: no patches, 1 candidate
+# Override: use 3 candidates for this run only
+BLINDED_DEBUGGER_NUM_CANDIDATES=3 \
+ORACLE_TRIAD_CONFIG=no_patches.yaml \
+bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh \
+  llm.eval_glm5_fp8_t0 HEAD
 ```
 
-This uses regex-based claim extraction and skips LLM-assisted rule resolution and verdict synthesis. Only deterministic symbolic rules are evaluated. Faster but may produce more false positives (unnecessary rejections).
-
-### 9.4 Disabling Validation for Ablation
-
-```bash
-export PROPOSAL_VALIDATOR=none
-```
-
-All planner proposals are accepted without verification. Useful for measuring the impact of the verifier on trajectory quality in controlled experiments.
-
-### 9.5 Custom Instance Selection
-
-```bash
-# Single instance
-export INSTANCE_IDS=django__django-12663
-
-# Multiple instances (comma-separated)
-export INSTANCE_IDS=django__django-12663,astropy__astropy-14995,sympy__sympy-20049
-```
-
-Or pass via command line:
-```bash
-poetry run python evaluation/benchmarks/swe_bench_optimized/run_infer_oracle_triad.py \
-  ... \
-  --instance-ids django__django-12663,astropy__astropy-14995
-```
+The env var (`3`) wins over the YAML value (`1`), which wins over the Python default (`1`).

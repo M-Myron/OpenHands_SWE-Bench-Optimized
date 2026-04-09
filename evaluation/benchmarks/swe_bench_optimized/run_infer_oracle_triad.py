@@ -81,33 +81,72 @@ def _load_preprocess_analysis(instance_id: str) -> str:
     preprocess_dir = os.environ.get('ORACLE_PREPROCESS_DIR', '').strip()
     if not preprocess_dir:
         return ''
-    analysis_path = os.path.join(preprocess_dir, f'{instance_id}_analysis.md')
-    if not os.path.isfile(analysis_path):
-        logger.info(f'[OracleTriad] No preprocess analysis found at {analysis_path}')
-        return ''
-    try:
-        with open(analysis_path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        logger.info(f'[OracleTriad] Loaded preprocess analysis ({len(content)} chars) from {analysis_path}')
-        return content
-    except Exception as exc:
-        logger.warning(f'[OracleTriad] Failed to read preprocess analysis: {exc}')
-        return ''
+    # Try instance subdirectory first (swegym_v5 layout), then flat layout
+    candidates = [
+        os.path.join(preprocess_dir, instance_id, f'{instance_id}_analysis.md'),
+        os.path.join(preprocess_dir, instance_id, 'stage1_analysis.md'),
+        os.path.join(preprocess_dir, f'{instance_id}_analysis.md'),
+    ]
+    for analysis_path in candidates:
+        if os.path.isfile(analysis_path):
+            try:
+                with open(analysis_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                logger.info(f'[OracleTriad] Loaded preprocess analysis ({len(content)} chars) from {analysis_path}')
+                return content
+            except Exception as exc:
+                logger.warning(f'[OracleTriad] Failed to read preprocess analysis: {exc}')
+                return ''
+    return ''
 
 
 def _load_react_facts(instance_id: str) -> dict | None:
-    """Load structured react facts JSON if available."""
+    """Load structured react facts JSON if available.
+
+    Supports three formats (tried in order):
+    1. Bridged graph: ``{preprocess_dir}/{instance_id}/stage3_bridged.json``
+       with ``graph`` (fact/bridge_fact/organizational_fact/plan_fact/edit_step/
+       validation_step nodes), single-evidence dict per node.
+    2. Stage-2 graph: ``{preprocess_dir}/{instance_id}/stage2_facts.json``
+       with ``graph`` (trigger/base_fact/... nodes), evidence as array.
+    3. Legacy stage-based: ``{preprocess_dir}/{instance_id}_react_facts.json``
+       with ``stages[].facts[]`` structure.
+    """
     preprocess_dir = os.environ.get('ORACLE_PREPROCESS_DIR', '').strip()
     if not preprocess_dir:
         return None
+
+    # Try bridged graph format first (swegym_v5 style)
+    bridged_path = os.path.join(preprocess_dir, instance_id, 'stage3_bridged.json')
+    if os.path.isfile(bridged_path):
+        try:
+            with open(bridged_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logger.info(f'[OracleTriad] Loaded bridged graph facts from {bridged_path}')
+            return data
+        except Exception as exc:
+            logger.warning(f'[OracleTriad] Failed to read bridged graph facts: {exc}')
+
+    # Try stage-2 graph format (swegym_v3 style)
+    graph_path = os.path.join(preprocess_dir, instance_id, 'stage2_facts.json')
+    if os.path.isfile(graph_path):
+        try:
+            with open(graph_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logger.info(f'[OracleTriad] Loaded graph-based facts from {graph_path}')
+            return data
+        except Exception as exc:
+            logger.warning(f'[OracleTriad] Failed to read graph facts: {exc}')
+
+    # Fallback to legacy format
     facts_path = os.path.join(preprocess_dir, f'{instance_id}_react_facts.json')
     if not os.path.isfile(facts_path):
-        logger.info(f'[OracleTriad] No react facts found at {facts_path}')
+        logger.info(f'[OracleTriad] No react facts found for {instance_id}')
         return None
     try:
         with open(facts_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        logger.info(f'[OracleTriad] Loaded react facts from {facts_path}')
+        logger.info(f'[OracleTriad] Loaded legacy react facts from {facts_path}')
         return data
     except Exception as exc:
         logger.warning(f'[OracleTriad] Failed to read react facts: {exc}')
@@ -299,6 +338,12 @@ if __name__ == '__main__':
     batch_size = args.eval_num_workers
     total_instances = len(swe_bench_tests)
     total_batches = (total_instances + batch_size - 1) // batch_size
+
+    # Load TriadConfig early so env vars are set before instance processing.
+    # This ensures process_instance_oracle_triad sees ORACLE_PLANNER_SAVE_PROMPTS etc.
+    from openhands.agenthub.oracle_triad_codeact_agent.triad_config import TriadConfig
+    _triad_cfg = TriadConfig.load()
+    _triad_cfg.export_to_env()
 
     logger.info('=' * 80)
     logger.info('ORACLE TRIAD EVALUATION PLAN:')

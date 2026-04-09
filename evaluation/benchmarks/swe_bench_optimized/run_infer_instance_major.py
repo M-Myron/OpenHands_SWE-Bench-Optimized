@@ -246,9 +246,15 @@ def _process_instance_with_sid(
     )
 
     runtime = create_runtime(config, sid=sid)
+    env_prepare_start = time.time()
     with base._env_prepare_concurrency_slot():
         call_async_from_sync(runtime.connect)
         base.initialize_runtime(runtime, instance, metadata)
+    env_prepare_elapsed = time.time() - env_prepare_start
+    logger.info(
+        f'Environment preparation for instance {instance.instance_id} '
+        f'took {env_prepare_elapsed:.1f}s'
+    )
 
     try:
         message_action = base.get_instruction(instance, metadata)

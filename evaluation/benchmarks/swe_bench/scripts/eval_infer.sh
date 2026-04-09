@@ -106,6 +106,7 @@ if [ -z "$INSTANCE_ID" ]; then
         --max_workers $N_PROCESS \
         --run_id $RUN_ID \
         $MODAL_FLAG
+    EVAL_EXIT_CODE=$?
 
     # get the "model_name_or_path" from the first line of the SWEBENCH_FORMAT_JSONL
     MODEL_NAME_OR_PATH=$(jq -r '.model_name_or_path' $SWEBENCH_FORMAT_JSONL | head -n 1)
@@ -138,6 +139,51 @@ if [ -z "$INSTANCE_ID" ]; then
         fi
 
         mv $REPORT_PATH $RESULT_OUTPUT_DIR/report.json
+    fi
+
+    # Fallback: if run_evaluation crashed (e.g. Docker clean_images race condition)
+    # but per-instance reports exist, generate aggregated report from them
+    if [ ! -f $RESULT_OUTPUT_DIR/report.json ]; then
+        INSTANCE_REPORTS=$(find $RESULT_OUTPUT_DIR/eval_outputs -name "report.json" 2>/dev/null | wc -l)
+        if [ "$INSTANCE_REPORTS" -gt 0 ]; then
+            echo "WARNING: run_evaluation exited with code $EVAL_EXIT_CODE and no aggregated report was generated."
+            echo "Generating report from $INSTANCE_REPORTS per-instance report files..."
+            poetry run python3 -c "
+import json, glob, os, sys
+base = sys.argv[1]
+reports = glob.glob(os.path.join(base, 'eval_outputs', '*', 'report.json'))
+per_instance = {}
+for r in sorted(reports):
+    with open(r) as f:
+        per_instance.update(json.load(f))
+resolved_ids = sorted(k for k, v in per_instance.items() if v.get('resolved', False))
+unresolved_ids = sorted(k for k, v in per_instance.items() if not v.get('resolved', False))
+empty_patch_ids = sorted(k for k, v in per_instance.items() if v.get('patch_is_None', False))
+error_ids = sorted(k for k, v in per_instance.items() if not v.get('patch_exists', True))
+report = {
+    'total_instances': len(per_instance),
+    'submitted_instances': len(per_instance),
+    'completed_instances': len(per_instance),
+    'empty_patch_instances': len(empty_patch_ids),
+    'resolved_instances': len(resolved_ids),
+    'unresolved_instances': len(unresolved_ids),
+    'error_instances': len(error_ids),
+    'unstopped_containers': 0,
+    'resolved_ids': resolved_ids,
+    'unresolved_ids': unresolved_ids,
+    'empty_patch_ids': empty_patch_ids,
+    'error_ids': error_ids,
+    'incomplete_ids': [],
+}
+report.update(per_instance)
+with open(os.path.join(base, 'report.json'), 'w') as f:
+    json.dump(report, f, indent=4)
+print(f'Generated fallback report: {len(per_instance)} instances, {len(resolved_ids)} resolved')
+" "$RESULT_OUTPUT_DIR"
+        else
+            echo "ERROR: run_evaluation failed (exit code $EVAL_EXIT_CODE) and no per-instance reports found."
+            exit 1
+        fi
     fi
 
     poetry run python evaluation/benchmarks/swe_bench/scripts/eval/update_output_with_eval.py $PROCESS_FILEPATH

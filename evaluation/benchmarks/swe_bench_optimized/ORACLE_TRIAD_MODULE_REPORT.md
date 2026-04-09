@@ -25,13 +25,15 @@ If critic rejects a proposal, feedback is sent back to planner for retry. When r
 |------|------|
 | `openhands/agenthub/oracle_triad_codeact_agent/__init__.py` | Registers `OracleTriadCodeActAgent` in `Agent` registry |
 | `openhands/agenthub/oracle_triad_codeact_agent/oracle_triad_codeact_agent.py` | Main triad orchestration agent + per-process triad logging helpers |
-| `openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py` | Oracle planner LLM wrapper + `PlannerDecision` parsing + `ReactFactTracker` |
+| `openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py` | Oracle planner LLM wrapper + `PlannerDecision` parsing + `ReactFactTracker` (graph DAG + legacy) |
 | `openhands/agenthub/oracle_triad_codeact_agent/proposal_critic.py` | Blinded proposal critic wrapper + `ProposalValidationResult` |
-| `openhands/agenthub/oracle_triad_codeact_agent/prompts/planner_select_or_propose.j2` | Planner prompt template (includes react facts section) |
+| `openhands/agenthub/oracle_triad_codeact_agent/prompts/planner_select_or_propose.j2` | Planner prompt template (includes investigation graph facts section) |
 | `openhands/agenthub/oracle_triad_codeact_agent/prompts/validate_oracle_proposal.j2` | Proposal critic prompt template (includes fact preconditions section) |
 | `evaluation/benchmarks/swe_bench_optimized/run_infer_oracle_triad.py` | Eval entrypoint + per-instance oracle context writer + react facts loader |
 | `evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer.sh` | Shell launcher |
-| `evaluation/evaluation_outputs/outputs/.../preprocess/{id}_react_facts.json` | Per-instance structured react facts (input data) |
+| `evaluation/evaluation_outputs/outputs/.../preprocess/{id}/stage3_bridged.json` | Per-instance bridged investigation DAG (v5 format) |
+| `evaluation/evaluation_outputs/outputs/.../preprocess/{id}/stage2_facts.json` | Per-instance graph-based investigation DAG (v3 format) |
+| `evaluation/evaluation_outputs/outputs/.../preprocess/{id}_react_facts.json` | Per-instance structured react facts (legacy format) |
 
 ---
 
@@ -119,17 +121,27 @@ Fields:
 
 Class: `ReactFactTracker`
 
-Manages structured react facts and their per-step usage state. Loaded from `{instance_id}_react_facts.json`.
+Manages structured investigation facts with per-step usage state and DAG-based availability. Supports three data formats:
+
+1. **Bridged graph** (swegym_v5 `stage3_bridged.json`): nodes with categories (`fact`, `bridge_fact`, `organizational_fact`, `plan_fact`, `edit_step`, `validation_step`), single evidence dict per node `{action, observation}`, plus `motivation`, `is_root`, `grounding`, and `discovery_type` fields.
+2. **Stage-2 graph** (swegym_v3 `stage2_facts.json`): nodes with categories (`trigger`, `base_fact`, ...), evidence as array of `{reasoning, action, observation}` dicts. Fully backward compatible.
+3. **Legacy stage-based** (`_react_facts.json`): flat `stages[].facts[]` structure, internally converted to graph-compatible nodes.
 
 Key API:
 
-- `__init__(react_facts_data: dict | None)` — parses JSON `stages[].facts[]`, generates IDs like `phase_3_exploration_0`
+- `__init__(react_facts_data: dict | None)` — auto-detects format via `graph` vs `stages` key; normalizes v5 single-dict evidence to 1-element list; parses nodes with IDs like `f1`, `b2`, `e1` (graph) or `phase_3_exploration_0` (legacy)
 - `has_facts -> bool`
-- `get_available_facts() -> list[dict]` — returns unused facts
-- `mark_facts_used(fact_ids: list[str])` — marks facts as consumed; they no longer appear in prompt
-- `get_preconditions_for_facts(fact_ids) -> list[dict]` — returns fact ID, stage, summary, and preconditions for specified IDs
-- `render_available_facts_text() -> str` — renders unused facts grouped by stage with fact content, preconditions, recommended reasoning, and recommended action
-- `get_usage_summary() -> dict` — returns `{total_facts, used_facts, remaining_facts, used_fact_ids}`
+- `is_graph_mode -> bool` — True if loaded from any graph-based format
+- `get_available_nodes() -> list[dict]` — returns nodes that are (a) not fully_used AND (b) all precondition nodes are fully_used. Enforces DAG ordering.
+- `mark_facts_used(fact_ids: list[str])` — accepts node IDs (e.g. `"f1"`, `"b2"`). Also supports legacy compound IDs (`"t1:0"`).
+- `get_preconditions_for_facts(fact_ids) -> list[dict]` — returns resolved preconditions; in graph mode, precondition node IDs are resolved to include category + statement text
+- `render_available_facts_text() -> str` — renders only available (precondition-satisfied, not-fully-used) nodes grouped by category; includes `motivation` field for v5 nodes; fully-used nodes omitted entirely
+- `get_usage_summary() -> dict` — returns `{total_nodes, fully_used_nodes, available_nodes, blocked_nodes, total_evidence, used_evidence, ...}`
+
+Node usage states:
+- **not_used**: no evidence items consumed
+- **partially_used**: some (not all) evidence items consumed — shown with used items marked
+- **fully_used**: all evidence items consumed — omitted from planner input; unlocks downstream nodes
 
 Behavior:
 
@@ -210,7 +222,7 @@ Output JSON schema (required):
   "chosen_candidate_index": 0,
   "reason": "...",
   "proposal_response": "...",
-  "referenced_fact_ids": ["phase_1_reading_0", "phase_3_exploration_2"]
+  "referenced_fact_ids": ["f1", "f2", "b1"]
 }
 ```
 
@@ -218,9 +230,9 @@ Important hard rules in prompt:
 
 - planner must **always** output `best_candidate_index`, even when proposing.
 - `proposal_response` MUST contain both REASONING text and a `[TOOL CALL]` suggestion using exact tool names from the Available Tools section.
-- `referenced_fact_ids` MUST list all fact IDs used to inform the decision. When proposing, should reference at least one fact if applicable unused facts remain.
-- **SFT Data Quality & Workflow Phase Discipline**: explicit 8-phase workflow ordering enforced. NEVER propose/select Phase 6 (edit) without Phase 5 (analysis) shown in history. When all candidates skip a phase, MUST propose the missing phase step.
+- `referenced_fact_ids` MUST list all consumed node IDs (e.g. `"f1"`, `"b2"`). When proposing, should reference at least one fact if applicable unused facts remain.
 - **Fact usage rules**: check preconditions before using a fact, adapt reasoning/action (don't copy verbatim), use facts aggressively when preconditions are met.
+- **DAG-gated availability**: only nodes whose preconditions are all fully_used are shown in the prompt. Downstream nodes progressively unlock as upstream nodes are consumed.
 
 ### 4.2 Proposal critic prompt
 
@@ -867,21 +879,137 @@ jq -r 'select(.event=="proposal_critic_validation") | .valid' <oracle_triad_logs
 
 ---
 
-## 13. Filled Session Handoff — 2025-03 Planner Prompt Enhancement
+## 14. Session: 2026-04-06 — Graph Fact System v5, DAG-Gated Availability, Investigation-First
+
+### Overview
+
+Major rewrite of the fact tracking system to support v5 `stage3_bridged.json` format, enforce DAG-gated availability with investigation-first ordering, simplify usage tracking to boolean, and remove overly strict workflow enforcement.
+
+### Changes
+
+#### 14.1 Three-Format Fact Loading
+- `_load_react_facts()` now tries: `stage3_bridged.json` → `stage2_facts.json` → `_react_facts.json`
+- Shell launcher auto-detects `swegym_v5` → `swegym_v3` → bare preprocess dir
+- `ReactFactTracker` normalizes v5 single-dict evidence to 1-element list internally
+
+#### 14.2 Simplified Boolean Usage Tracking
+- Replaced per-evidence `_evidence_used[node_id] = [False, ...]` with `_used[node_id] = False/True`
+- Duplicate marking silently skipped (was producing repeated log entries)
+- `mark_facts_used(fact_ids, step_index=N)` now logs step number: `Marked f9 as used (step 15).`
+
+#### 14.3 DAG-Gated Availability with Investigation Bypass
+- Nodes only shown to planner when all precondition nodes are used
+- Once all investigation nodes (`fact`, `bridge_fact`) are consumed, ALL remaining implementation nodes (`organizational_fact`, `plan_fact`, `edit_step`, `validation_step`) become available — preconditions bypassed
+
+#### 14.4 Removed Strict Workflow Enforcement
+- Removed A-family rules (A1–A4) from symbolic rule engine — caused false rejections (e.g. runtime probes rejected as "verification before implementation")
+- Planner prompt: workflow is now "Recommended Workflow" (soft guideline)
+- Critic prompt: removed "Workflow Phase Enforcement" section and all phase-specific red flags
+
+#### 14.5 Natural Proposal Format & No Oracle Leakage
+- Replaced "Part 1 — REASONING / Part 2 — TOOL CALL" with natural developer-style response
+- Added hard constraint: **NEVER mention fact IDs, node IDs, or oracle concepts in `proposal_response`** — becomes SFT training data
+- Encourages using fact `motivation` fields to craft natural explanations
+
+#### 14.6 Fact Consumption Criteria
+- Consume ONLY when: (1) fact's action performed AND (2) fact's statement visible in history
+- If action done but statement not articulated → propose `think` call to state finding
+- Selecting a candidate that approaches but doesn't fulfill → do NOT consume
+- "Complete investigation before implementation": blocks code edits while investigation facts remain
+
+#### 14.7 Verifier Improvements
+- Added retry mechanism (2 retries) for LLM call failures + JSON parse failures in rule resolution
+- Added D4 rule (`evidence.D4_fact_prerequisites_visible`): checks prerequisite facts' knowledge is visible in history (LLM-assisted, medium severity)
+- Improved fact precondition rendering in critic/extraction templates (fixed empty `(stage: )` display)
+- Rejected proposal text now included in planner feedback so it knows what was rejected
+
+#### 14.8 Bug Fixes
+- `best_candidate_index is None` TypeError crash — added None guard in `_plan_next_response`
+- Duplicate fact marking — silently skip already-used nodes
+
+---
+
+## 15. Filled Session Handoff — 2026-04-06
 
 ### Handoff for Next Session
 
-- **Main takeaway**: Planner prompt was enhanced with tool catalog, structured REASONING+TOOL CALL proposal format, improved guidance injection, history dedup, and reasoning injection into materialized responses. Initial evidence from GLM-5-FP8 eval shows planner correctly using the format but the debugger was dropping reasoning text (content=[]) during materialization — now fixed by extracting reasoning from the proposal and injecting it into the response. No regressions observed in prompt rendering.
-- **Blocking issue**: None. All changes compile and template renders correctly.
-- **Highest-priority next action**: Run a smoke eval (`EVAL_LIMIT=1`) with the updated code to verify end-to-end materialization quality — specifically whether the debugger faithfully executes the planner's two-part guidance.
+- **Main takeaway**: The oracle triad agent now supports v5 graph facts (`stage3_bridged.json`) with DAG-gated availability & investigation-first enforcement. Usage tracking simplified to boolean. Strict workflow rules removed. Verified working on MONAI-1012 instance — facts consumed progressively across steps, investigation completed before edit proposals.
+- **Blocking issues**: 
+  - GLM-5-FP8 occasionally produces non-JSON planner responses (handled by existing retry logic)
+  - B4 rule can sometimes block fact-guided proposals that specify line ranges the debugger hasn't discovered via grep yet (LLM resolution helps but adds latency)
+- **Highest-priority next actions**:
+  1. Run multi-instance evaluation (e.g. 10 instances) to measure fact consumption rates and trajectory quality
+  2. Check whether the "investigation-first" rule produces unnecessarily long trajectories when facts are redundant
+  3. Evaluate whether D4 rule catches real prerequisite violations without too many false positives
 - **Files to inspect first**:
-  - `evaluation/benchmarks/swe_bench_optimized/ORACLE_TRIAD_MODULE_REPORT.md` (this file, Section 9)
-  - `openhands/agenthub/oracle_triad_codeact_agent/oracle_triad_codeact_agent.py` (changes in `_build_tool_descriptions`, `_inject_planner_guidance`, `_render_history_text_full`)
-  - `openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py` (`tool_descriptions` param)
-  - `openhands/agenthub/oracle_triad_codeact_agent/prompts/planner_select_or_propose.j2` (tool catalog + proposal format sections)
+  - `openhands/agenthub/oracle_triad_codeact_agent/oracle_planner.py` — `ReactFactTracker` (DAG, investigation bypass, boolean usage)
+  - `openhands/agenthub/oracle_triad_codeact_agent/prompts/planner_select_or_propose.j2` — fact usage rules, constraints, proposal format
+  - `openhands/agenthub/oracle_triad_codeact_agent/symbolic_rules.py` — A-family removed, D4 added
+  - `openhands/agenthub/oracle_triad_codeact_agent/verifier.py` — retry mechanism, D4 rule integration
 - **Representative logs**:
-  - `evaluation/evaluation_outputs/outputs/SWE-Gym__SWE-Gym-train/OracleTriadCodeActAgent/GLM-5-FP8_maxiter_100_N_v0.61.0-oracle-triad/oracle_planner_prompts/getmoto__moto-7365/step_0007_attempt_00.txt`
+  - `evaluation/evaluation_outputs/outputs/SWE-Gym__SWE-Gym-train/OracleTriadCodeActAgent/GLM-5-FP8_maxiter_100_N_v0.61.0-oracle-triad/` — MONAI-1012 instance
 - **Key risks to watch**:
-  - Debugger may ignore the `[TOOL CALL]` suggestion in guidance and generate a different action
-  - Tool descriptions add ~2-3K tokens to every planner prompt — monitor for context window pressure in long trajectories
-  - `_truncate_text()` removal for base instructions means the full system prompt (~4K chars) is included in every planner call
+  - The "complete investigation before implementation" rule may force unnecessary investigation when the debugger has already figured out the fix
+  - Long trajectories (60+ steps) suggest the agent sometimes gets stuck — may need a "give up on remaining facts" threshold
+  - Fact-guided proposals specifying exact line ranges get rejected by B4 if the debugger hasn't grepped first — the planner must use grep to discover line numbers before proposing view ranges
+
+---
+
+## 16. Session: 2026-04-07 — Performance Optimizations
+
+### 16.1 Windowed Planner History
+- Planner now receives windowed history (SESSION SUMMARY + last N action steps) instead of full history
+- Env var: `ORACLE_PLANNER_HISTORY_WINDOW=5` (default), `-1` or `0` for full history
+- Critic/verifier still receives full history (needs it for grounding checks)
+- New method: `_render_history_text_windowed(events, window=5)` alongside existing `_render_history_text_full(events)`
+- Expected savings: ~5-15K tokens per planner call at later steps (history=7K→2K at step 24)
+
+### 16.2 Batched LLM Rule Resolution (Stage 3.5)
+- Replaced per-rule sequential LLM calls with a single batched call
+- New template: `prompts/resolve_rules_batch.j2` — renders all failing rules + shared evidence in one prompt
+- LLM returns `{"results": [{"rule_id": "B2", "verdict": "overruled", "reason": "..."}, ...]}` 
+- Per-rule context fields (`oracle_dependent_claims`, `reasoning_claims`, `nearby_evidence`) preserved under each rule section
+- Reduced 1-7 LLM calls to exactly 1 per verification attempt
+- Old template `resolve_rule.j2` kept as reference but no longer called
+
+### 16.3 Timing Instrumentation
+- Per-step timing in agent log: `Step N timing: candidates=Xs (N calls), planner=Xs (N calls), verifier=Xs (N calls), materialization=Xs, total=Xs (N LLM calls)`
+- Per-verifier-step timing: `Step N attempt M: extraction=Xs, retrieval=Xs, symbolic=Xs, llm_resolution=Xs, synthesis=Xs, total=Xs (N LLM calls) verdict=X`
+- Planner prompt composition: `Step N prompt: ~XXXX tokens | issue=, oracle=, history=, candidates=, facts=, tools=, feedback=, template=`
+- Timing events logged to triad JSONL as `step_timing` events
+- Verifier exposes `_timing` metadata on `VerificationVerdict` for accurate LLM call counting
+
+### 16.4 Bug Fixes
+- Fixed verifier LLM call count always showing 0 in agent log (was using non-existent `_llm_calls` key)
+- Fixed `ORACLE_PLANNER_HISTORY_WINDOW`: 0 and -1 now both mean full history (not clamped to 1)
+
+---
+
+## 17. Filled Session Handoff — 2026-04-07
+
+### Handoff for Next Session
+
+- **Main takeaway**: Major performance optimizations: windowed planner history (saves ~50% of history tokens at step 20+), batched LLM rule resolution (1 call instead of 1-7), comprehensive timing instrumentation. Tested on getmoto__moto-6857 — 52 steps with all 33 facts consumed, timing shows planner ~7s, verifier ~20-30s per proposal validation.
+- **Blocking issues**: 
+  - GLM-5-FP8 Non-JSON planner responses (10%+ rate in late steps when prompt >25K tokens) — may need to truncate oracle context or use a more instruction-following model
+  - Verifier extraction stage takes 10-30s per call (LLM-based claim extraction) — `VERIFIER_PROGRAMMATIC_ONLY=1` can eliminate this but with less precise claims
+- **Highest-priority next actions**:
+  1. Run the fast config (`CANDIDATES=1, RETRIES=1, VALIDATOR=none`) on 10+ instances to measure resolve rate without verification overhead
+  2. Evaluate windowed history impact on planner decision quality (does it miss important context from earlier steps?)
+  3. Consider using programmatic-only extraction + batched resolution as the default "balanced" mode
+  4. Add a mechanism to "give up" on remaining facts after N consecutive steps without fact consumption (prevents stalling at 50+ steps)
+- **Files to inspect first**:
+  - `openhands/agenthub/oracle_triad_codeact_agent/oracle_triad_codeact_agent.py` — windowed history, timing instrumentation
+  - `openhands/agenthub/oracle_triad_codeact_agent/verifier.py` — batched resolution, timing
+  - `openhands/agenthub/oracle_triad_codeact_agent/prompts/resolve_rules_batch.j2` — batched template
+- **Representative timing data** (getmoto__moto-6857, window=full, 3rd run):
+  - Step 1-10: ~8-35s per step (planner ~6s, verifier ~20s when triggered)
+  - Step 20-30: ~10-130s per step (history growing, JSON parse retries)
+  - Step 40-52: ~8-145s per step (large prompts, intermittent non-JSON)
+- **Key configuration for next run**:
+  ```bash
+  export BLINDED_DEBUGGER_NUM_CANDIDATES=1
+  export ORACLE_PLANNER_HISTORY_WINDOW=5
+  export ORACLE_PLANNER_MAX_RETRIES=1
+  export PROPOSAL_VALIDATOR=verifier  # or none for speed
+  ```

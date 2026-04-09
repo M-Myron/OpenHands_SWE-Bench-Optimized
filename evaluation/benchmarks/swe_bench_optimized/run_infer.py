@@ -613,9 +613,9 @@ def complete_runtime(
 
     if obs.exit_code == -1:
         # The previous command is still running
-        # We need to kill previous command
-        logger.info('The previous command is still running, trying to kill it...')
-        action = CmdRunAction(command='C-c')
+        # We need to kill previous command via terminal input signals
+        logger.info('The previous command is still running, trying to C-c (as input)...')
+        action = CmdRunAction(command='C-c', is_input=True)
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
@@ -627,10 +627,23 @@ def complete_runtime(
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
     if obs.exit_code == -1:
-        # The previous command is still running
-        # We need to kill previous command
-        logger.info('The previous command is still running, trying to ctrl+z it...')
-        action = CmdRunAction(command='C-z')
+        # C-c didn't work, try C-z to suspend
+        logger.info('The previous command is still running, trying C-z (as input)...')
+        action = CmdRunAction(command='C-z', is_input=True)
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+        # Then run the command again
+        action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+    if obs.exit_code == -1:
+        # C-z didn't work either, try C-d (EOF) as last resort
+        logger.info('The previous command is still running, trying C-d (as input)...')
+        action = CmdRunAction(command='C-d', is_input=True)
         obs = runtime.run_action(action)
         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
 
@@ -790,12 +803,18 @@ def process_instance(
     )
 
     runtime = create_runtime(config)
+    env_prepare_start = time.time()
     with _env_prepare_concurrency_slot():
         call_async_from_sync(runtime.connect)
 
         # Runtime initialization is the environment preparation stage.
         # Keep this inside the throttle so only a limited number of workers do it concurrently.
         initialize_runtime(runtime, instance, metadata)
+    env_prepare_elapsed = time.time() - env_prepare_start
+    logger.info(
+        f'Environment preparation for instance {instance.instance_id} '
+        f'took {env_prepare_elapsed:.1f}s'
+    )
 
     try:
         message_action = get_instruction(instance, metadata)
