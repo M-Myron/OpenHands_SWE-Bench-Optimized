@@ -50,6 +50,8 @@ PREPARE_ENV_MAX_WORKERS=${12:-${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-8}}
 # Skip instances that reach maximum retries instead of crashing the entire evaluation
 # Failed instances will be logged to maximum_retries_exceeded.jsonl
 export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
+export OH_RUNTIME_RUNTIME_IMAGE_REPO="docker.io/mmr1115/openhands-runtime"
+
 
 if [ -n "$PREPARE_ENV_MAX_WORKERS" ] && [ "$PREPARE_ENV_MAX_WORKERS" -gt 0 ] 2>/dev/null; then
     export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=$PREPARE_ENV_MAX_WORKERS

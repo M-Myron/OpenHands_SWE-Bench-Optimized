@@ -104,13 +104,27 @@ if [ -z "$INSTANCE_ID" ]; then
     RESULT_OUTPUT_DIR=$(dirname $SWEBENCH_FORMAT_JSONL)
     echo "RESULT_OUTPUT_DIR: $RESULT_OUTPUT_DIR"
 
-    # Restore previous logs so SWE-Bench can skip successfully processed instances
-    if [ -d "$RESULT_OUTPUT_DIR/eval_outputs" ]; then
-        echo "Found previous evaluation outputs. Restoring them to skip already processed instances..."
-        mkdir -p logs/run_evaluation/$RUN_ID
-        # copy the old eval_outputs to the place where swebench expects them
-        cp -r $RESULT_OUTPUT_DIR/eval_outputs logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH
+    EVAL_TEMP_DIR=logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH
+    mkdir -p $RESULT_OUTPUT_DIR/eval_outputs
+    mkdir -p $EVAL_TEMP_DIR
+
+    # Restore previous results so SWE-bench skips already-evaluated instances
+    ALREADY_EVALED=$(find $RESULT_OUTPUT_DIR/eval_outputs -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    if [ "$ALREADY_EVALED" -gt 0 ]; then
+        echo "Found $ALREADY_EVALED already-evaluated instances in $RESULT_OUTPUT_DIR/eval_outputs. Copying them so they will be skipped..."
+        cp -r $RESULT_OUTPUT_DIR/eval_outputs/* $EVAL_TEMP_DIR/ 2>/dev/null || true
     fi
+
+    # Trap to copy results from temp dir to final dir on exit (normal, error, or interrupt)
+    function copy_eval_results() {
+        echo ""
+        echo "Copying evaluation results from $EVAL_TEMP_DIR to $RESULT_OUTPUT_DIR/eval_outputs ..."
+        if [ -d "$EVAL_TEMP_DIR" ]; then
+            cp -r $EVAL_TEMP_DIR/* $RESULT_OUTPUT_DIR/eval_outputs/ 2>/dev/null || true
+            echo "Done copying evaluation results."
+        fi
+    }
+    trap copy_eval_results EXIT
 
     poetry run python -m swebench.harness.run_evaluation \
         --dataset_name "$DATASET_NAME" \
@@ -122,15 +136,9 @@ if [ -z "$INSTANCE_ID" ]; then
         --run_id $RUN_ID \
         $MODAL_FLAG
 
-    # move the eval results to the target directory
-    mkdir -p $RESULT_OUTPUT_DIR
-    # rm eval_outputs directory if it exists
-    if [ -d $RESULT_OUTPUT_DIR/eval_outputs ]; then
-        rm -rf $RESULT_OUTPUT_DIR/eval_outputs
-    fi
+    # The trap will copy results on exit. Also clean up temp dir.
+    rm -rf logs/run_evaluation/$RUN_ID 2>/dev/null || true
 
-    mv logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH $RESULT_OUTPUT_DIR
-    mv $RESULT_OUTPUT_DIR/$MODEL_NAME_OR_PATH $RESULT_OUTPUT_DIR/eval_outputs
     echo "RUN_ID: $RUN_ID" > $RESULT_OUTPUT_DIR/run_id.txt
 
     # move report file
