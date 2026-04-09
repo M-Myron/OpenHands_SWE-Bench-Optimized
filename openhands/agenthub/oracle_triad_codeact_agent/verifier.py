@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,6 +65,8 @@ class VerificationVerdict:
     raw_extraction_response: str = ''
     raw_synthesis_response: str = ''
     reason: str = ''
+    # Timing metadata (not serialized to verdict JSON, but accessible by agent)
+    _timing: dict = field(default_factory=dict, repr=False)
 
     @property
     def valid(self) -> bool:
@@ -159,7 +162,12 @@ class HistoryGroundedVerifier:
     ) -> VerificationVerdict:
         """Run the full 4-stage verification pipeline."""
 
+        verify_t0 = time.monotonic()
+        vtiming: dict[str, float] = {}
+        vllm_calls = 0
+
         # ---- Stage 1: Claim & precondition extraction --------------------
+        t0 = time.monotonic()
         history_summary = history_memory.summary()
 
         if isinstance(self._claim_extractor, ClaimExtractor):
@@ -183,19 +191,26 @@ class HistoryGroundedVerifier:
         self._maybe_save_prompt(
             step_index, attempt, 'extraction', raw_extraction_prompt, raw_extraction,
         )
+        vtiming['stage1_extraction'] = time.monotonic() - t0
+        vllm_calls += 1  # extraction is 1 LLM call (unless programmatic)
 
         # ---- Stage 2: History-grounded retrieval -------------------------
+        t0 = time.monotonic()
         retrieved_units, retrieval_queries = self._run_retrieval(
             extraction, history_memory,
         )
+        vtiming['stage2_retrieval'] = time.monotonic() - t0
 
         # ---- Stage 3: Symbolic rule evaluation ---------------------------
+        t0 = time.monotonic()
         engine = SymbolicRuleEngine(history_memory, self.issue_text)
         rule_results = engine.evaluate_all(
             claims=extraction.claims,
             preconditions=extraction.all_preconditions,
             retrieved_units=retrieved_units,
+            fact_preconditions=fact_preconditions,
         )
+        vtiming['stage3_symbolic'] = time.monotonic() - t0
 
         # Check for deterministic (non-LLM-assist) high-severity failures first.
         # If present, reject immediately without spending LLM calls.
@@ -204,8 +219,11 @@ class HistoryGroundedVerifier:
             # Skip LLM resolution — deterministic reject
             failed_high = deterministic_high
             uncertain = engine.get_uncertain(rule_results)
+            vtiming['stage3_5_llm_resolution'] = 0.0
         else:
             # ---- Stage 3.5: LLM-assisted rule resolution -----------------
+            t0 = time.monotonic()
+            llm_rules_count = len(SymbolicRuleEngine.get_llm_assist_needed(rule_results))
             rule_results = self._resolve_llm_assisted_rules(
                 rule_results=rule_results,
                 proposal_text=proposal_text,
@@ -213,11 +231,15 @@ class HistoryGroundedVerifier:
                 step_index=step_index,
                 attempt=attempt,
             )
+            vtiming['stage3_5_llm_resolution'] = time.monotonic() - t0
+            if llm_rules_count > 0:
+                vllm_calls += 1  # single batched call for all rules
             # Recalculate after LLM resolution (all llm_assist flags cleared)
             failed_high = engine.get_failed_high(rule_results)
             uncertain = engine.get_uncertain(rule_results)
 
         # ---- Stage 4: Verdict synthesis ----------------------------------
+        t0 = time.monotonic()
         verdict, reason, suspected_leakage, suggestion, raw_synthesis = (
             self._synthesize_verdict(
                 step_index=step_index,
@@ -229,6 +251,22 @@ class HistoryGroundedVerifier:
                 retrieved_units=retrieved_units,
                 attempt=attempt,
             )
+        )
+        vtiming['stage4_synthesis'] = time.monotonic() - t0
+        if raw_synthesis:
+            vllm_calls += 1  # synthesis made an LLM call
+
+        vtiming['verify_total'] = time.monotonic() - verify_t0
+
+        logger.info(
+            f'[HistoryGroundedVerifier] Step {step_index} attempt {attempt}: '
+            f'extraction={vtiming["stage1_extraction"]:.1f}s, '
+            f'retrieval={vtiming["stage2_retrieval"]:.2f}s, '
+            f'symbolic={vtiming["stage3_symbolic"]:.2f}s, '
+            f'llm_resolution={vtiming["stage3_5_llm_resolution"]:.1f}s, '
+            f'synthesis={vtiming["stage4_synthesis"]:.1f}s, '
+            f'total={vtiming["verify_total"]:.1f}s ({vllm_calls} LLM calls) '
+            f'verdict={verdict}'
         )
 
         # Build feedback message for planner retry
@@ -259,6 +297,7 @@ class HistoryGroundedVerifier:
             suggestion=suggestion,
             raw_extraction_response=raw_extraction,
             raw_synthesis_response=raw_synthesis,
+            _timing={**vtiming, 'llm_calls': vllm_calls},
         )
 
         # Save the full verdict as a prompt log for debugging
@@ -336,9 +375,10 @@ class HistoryGroundedVerifier:
     ) -> list[RuleResult]:
         """Resolve rules that failed symbolically but are marked for LLM adjudication.
 
-        For each rule with ``needs_llm_assist=True``, we make a focused one-shot
-        LLM call using the ``resolve_rule.j2`` template.  If the LLM overrules
-        the symbolic failure, we flip the result to passed.
+        For rules with ``needs_llm_assist=True``, we make a **single batched**
+        LLM call using the ``resolve_rules_batch.j2`` template to resolve all
+        failing rules at once. If the LLM overrules a symbolic failure, we flip
+        the result to passed.
 
         Returns a NEW list of RuleResult (original list is not mutated).
         """
@@ -360,98 +400,106 @@ class HistoryGroundedVerifier:
             for u in retrieved_units
         ]
 
-        template = self._jinja_env.get_template('resolve_rule.j2')
+        # Render a single batched prompt for ALL failing rules
+        template = self._jinja_env.get_template('resolve_rules_batch.j2')
+        prompt = template.render(
+            rules=llm_rules,
+            proposal_text=proposal_text,
+            issue_text=self.issue_text,
+            evidence_snippets=evidence_snippets,
+        )
 
-        # Map rule_id -> resolved RuleResult
-        resolved: dict[str, RuleResult] = {}
+        max_resolve_retries = 2
+        data = None
 
-        for rule in llm_rules:
-            prompt = template.render(
-                rule=rule,
-                proposal_text=proposal_text,
-                issue_text=self.issue_text,
-                evidence_snippets=evidence_snippets,
-            )
-
+        for resolve_try in range(max_resolve_retries + 1):
             try:
                 response = self.llm.completion(
                     messages=[{'role': 'user', 'content': prompt}],
                 )
                 raw_text = response.choices[0].message.content or ''
             except Exception as exc:
+                if resolve_try < max_resolve_retries:
+                    logger.warning(
+                        f'[HistoryGroundedVerifier] Batch resolution LLM call failed '
+                        f'(attempt {resolve_try + 1}): {exc}. Retrying...'
+                    )
+                    continue
                 logger.warning(
-                    f'[HistoryGroundedVerifier] LLM resolution for {rule.rule_id} '
-                    f'failed: {exc}. Keeping symbolic result (fail-open).'
+                    f'[HistoryGroundedVerifier] Batch resolution failed after '
+                    f'{max_resolve_retries + 1} attempts: {exc}. Fail-open override for all rules.'
                 )
-                # Fail-open: treat as overruled (pass)
-                resolved[rule.rule_id] = RuleResult(
-                    rule_id=rule.rule_id,
-                    rule_family=rule.rule_family,
-                    passed=True,
-                    severity=rule.severity,
-                    reason=f'LLM resolution failed ({exc}); fail-open override.',
-                    needs_llm_assist=False,
-                    llm_context={},
-                )
-                continue
+                raw_text = ''
+                break
 
             self._maybe_save_prompt(
-                step_index, attempt, f'resolve_{rule.rule_id}', prompt, raw_text,
+                step_index, attempt, 'resolve_batch', prompt, raw_text,
             )
 
-            # Parse LLM response
             json_str = _extract_json(raw_text)
-            if json_str is None:
+            if json_str is not None:
+                try:
+                    data = json.loads(json_str)
+                    if 'results' in data and isinstance(data['results'], list):
+                        break
+                    data = None
+                except json.JSONDecodeError:
+                    data = None
+
+            if resolve_try < max_resolve_retries:
                 logger.warning(
-                    f'[HistoryGroundedVerifier] Unparseable LLM response for '
-                    f'{rule.rule_id}; fail-open override.'
+                    f'[HistoryGroundedVerifier] Unparseable batch response '
+                    f'(attempt {resolve_try + 1}). Retrying...'
                 )
+            else:
+                logger.warning(
+                    f'[HistoryGroundedVerifier] Batch resolution unparseable after '
+                    f'{max_resolve_retries + 1} attempts. Fail-open override for all rules.'
+                )
+
+        # Parse results into a map: rule_id -> {verdict, reason}
+        llm_verdicts: dict[str, dict] = {}
+        if data and 'results' in data:
+            for entry in data['results']:
+                rid = str(entry.get('rule_id', ''))
+                if rid:
+                    llm_verdicts[rid] = {
+                        'verdict': str(entry.get('verdict', '')).lower(),
+                        'reason': str(entry.get('reason', '')),
+                    }
+
+        # Build resolved RuleResult map
+        resolved: dict[str, RuleResult] = {}
+        for rule in llm_rules:
+            v = llm_verdicts.get(rule.rule_id)
+            if v is None:
+                # Rule not found in LLM response → fail-open
                 resolved[rule.rule_id] = RuleResult(
                     rule_id=rule.rule_id,
                     rule_family=rule.rule_family,
                     passed=True,
                     severity=rule.severity,
-                    reason='LLM response unparseable; fail-open override.',
+                    reason='Rule not in batch LLM response; fail-open override.',
                     needs_llm_assist=False,
                     llm_context={},
                 )
-                continue
-
-            try:
-                data = json.loads(json_str)
-            except json.JSONDecodeError:
+            elif v['verdict'] == 'overruled':
                 resolved[rule.rule_id] = RuleResult(
                     rule_id=rule.rule_id,
                     rule_family=rule.rule_family,
                     passed=True,
                     severity=rule.severity,
-                    reason='LLM JSON malformed; fail-open override.',
-                    needs_llm_assist=False,
-                    llm_context={},
-                )
-                continue
-
-            llm_verdict = str(data.get('verdict', '')).lower()
-            llm_reason = str(data.get('reason', ''))
-
-            if llm_verdict == 'overruled':
-                resolved[rule.rule_id] = RuleResult(
-                    rule_id=rule.rule_id,
-                    rule_family=rule.rule_family,
-                    passed=True,
-                    severity=rule.severity,
-                    reason=f'LLM overruled: {llm_reason}',
+                    reason=f'LLM overruled: {v["reason"]}',
                     needs_llm_assist=False,
                     llm_context={},
                 )
             else:
-                # 'justified' or anything else → keep the failure
                 resolved[rule.rule_id] = RuleResult(
                     rule_id=rule.rule_id,
                     rule_family=rule.rule_family,
                     passed=False,
                     severity=rule.severity,
-                    reason=f'{rule.reason} [LLM confirmed: {llm_reason}]',
+                    reason=f'{rule.reason} [LLM confirmed: {v["reason"]}]',
                     needs_llm_assist=False,
                     llm_context={},
                 )

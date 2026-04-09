@@ -674,7 +674,12 @@ def _extract_and_validate_params(
                 pass
 
         # Enum check
-        if 'enum' in matching_tool['parameters']['properties'][param_name]:
+        if (
+            'parameters' in matching_tool
+            and 'properties' in matching_tool['parameters']
+            and param_name in matching_tool['parameters']['properties']
+            and 'enum' in matching_tool['parameters']['properties'][param_name]
+        ):
             if (
                 param_value
                 not in matching_tool['parameters']['properties'][param_name]['enum']

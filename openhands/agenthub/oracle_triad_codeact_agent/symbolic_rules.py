@@ -195,6 +195,7 @@ class SymbolicRuleEngine:
         claims: list[Claim],
         preconditions: list[Precondition],
         retrieved_units: list[HistoryUnit],
+        fact_preconditions: list[dict] | None = None,
     ) -> list[RuleResult]:
         """Run all applicable rules and return their results."""
         results: list[RuleResult] = []
@@ -207,6 +208,9 @@ class SymbolicRuleEngine:
         results.extend(self._family_C(claims, preconditions, retrieved_units))
         # Family D — evidence sufficiency
         results.extend(self._family_D(claims, preconditions, retrieved_units))
+        # D4 — fact prerequisite visibility
+        if fact_preconditions:
+            results.append(self._rule_D4_fact_prerequisites_visible(fact_preconditions))
         # Family E — discoverability
         results.extend(self._family_E(claims, preconditions))
 
@@ -252,22 +256,10 @@ class SymbolicRuleEngine:
         workflow_claims = [c for c in claims if c.claim_type == 'workflow']
         workflow_pcs = [p for p in preconditions if p.category == 'workflow']
 
-        # A1: Edit requires analysis
-        if edit_claims:
-            results.append(self._rule_A1_edit_requires_analysis(edit_claims, workflow_pcs))
-
-        # A2: Verification requires implementation
-        if self._claims_mention_verification(workflow_claims, claims):
-            results.append(self._rule_A2_verification_requires_implementation(workflow_claims, workflow_pcs))
-
-        # A3: Finalization requires verification
-        if self._claims_mention_finalization(workflow_claims, claims):
-            results.append(self._rule_A3_finalization_requires_verification(workflow_claims, workflow_pcs))
-
-        # A4: Phase completion claims require evidence
-        for wc in workflow_claims:
-            if self._claims_assert_completion(wc):
-                results.append(self._rule_A4_phase_completion_requires_evidence(wc, workflow_pcs))
+        # A-family rules (workflow ordering) have been removed.
+        # They were template-specific and caused false rejections —
+        # e.g. rejecting a runtime probe as "verification before implementation".
+        # The planner prompt now provides workflow as a soft guideline.
 
         return results
 
@@ -1417,6 +1409,90 @@ class SymbolicRuleEngine:
                 if has_analysis
                 else 'No reasoning/analysis evidence found in history. '
                      'Fix-analysis claims require prior think actions or detailed reasoning steps.'
+            ),
+        )
+
+    def _rule_D4_fact_prerequisites_visible(
+        self,
+        fact_preconditions: list[dict],
+    ) -> RuleResult:
+        """D4: Check that prerequisite facts' knowledge is visible in history.
+
+        When the oracle planner references a fact that has prerequisites,
+        those prerequisites' statements should be visible in the interaction
+        history (the debugger should have already discovered that knowledge).
+        If not, the proposal introduces an unjustified knowledge jump.
+
+        This rule uses LLM assistance because checking whether a fact's
+        statement is "visible" requires semantic matching, not just keyword search.
+        """
+        # Gather all history text for searching
+        all_text = self.issue_text
+        for u in self.memory.units:
+            all_text += '\n' + u.full_text
+        all_text_lower = all_text.lower()
+
+        missing_prereqs: list[str] = []
+        checked_prereqs: list[str] = []
+
+        for fp in fact_preconditions:
+            for pc_text in fp.get('preconditions', []):
+                # pc_text is like "[f8] (fact): The function is_supported_format..."
+                checked_prereqs.append(pc_text[:100])
+
+                # Extract the statement part (after the first "): ")
+                statement_part = pc_text
+                if '): ' in pc_text:
+                    statement_part = pc_text.split('): ', 1)[1]
+
+                # Check: are the key technical terms from this prerequisite
+                # visible in the history? We look for significant words.
+                words = [w for w in re.split(r'[\s,;.()]+', statement_part)
+                         if len(w) > 4 and w.lower() not in {
+                             'which', 'where', 'there', 'their', 'these',
+                             'those', 'about', 'would', 'could', 'should',
+                             'function', 'returns', 'using'
+                         }]
+
+                if not words:
+                    continue
+
+                # Require at least 40% of significant words to appear
+                found = sum(1 for w in words if w.lower() in all_text_lower)
+                if len(words) > 0 and found < len(words) * 0.4:
+                    missing_prereqs.append(pc_text[:150])
+
+        passed = len(missing_prereqs) == 0
+
+        # Use LLM assist for borderline cases
+        llm_assist = bool(missing_prereqs)
+        llm_ctx: dict = {}
+        if llm_assist:
+            llm_ctx = {
+                'question': (
+                    'The proposal relies on investigation facts whose prerequisites '
+                    'may not be visible in the interaction history. Check whether '
+                    'the knowledge described in each missing prerequisite has actually '
+                    'been discovered/observed by the debugger. If the knowledge is '
+                    'present even in a different form, the prerequisite is satisfied.'
+                ),
+                'missing_prerequisites': missing_prereqs,
+                'checked_prerequisites': checked_prereqs,
+            }
+
+        return RuleResult(
+            rule_id='evidence.D4_fact_prerequisites_visible',
+            rule_family='evidence',
+            passed=passed,
+            severity='medium',
+            related_claim_ids=[],
+            needs_llm_assist=llm_assist,
+            llm_context=llm_ctx,
+            reason=(
+                'All fact prerequisites are visible in the interaction history.'
+                if passed
+                else f'Missing prerequisite knowledge in history: {missing_prereqs}. '
+                     'The proposal may rely on knowledge the debugger has not yet discovered.'
             ),
         )
 

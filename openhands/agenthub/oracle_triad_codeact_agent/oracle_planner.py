@@ -38,108 +38,545 @@ class PlannerDecision:
 
 
 class ReactFactTracker:
-    """Tracks structured react facts and their usage state across planner steps."""
+    """Tracks structured facts and their usage state across planner steps.
+
+    Supports three data formats:
+    1. **Bridged graph** (swegym_v5 ``stage3_bridged.json``): a DAG of nodes with
+       categories (fact, bridge_fact, organizational_fact, plan_fact,
+       edit_step, validation_step), each with a **single** evidence dict
+       ``{action, observation}`` and a ``motivation`` field.
+    2. **Stage-2 graph** (swegym_v3 ``stage2_facts.json``): a DAG of nodes with
+       categories (trigger, base_fact, organizational_fact, plan_fact,
+       edit_step, validation_step), each with an **array** of evidence items.
+    3. **Legacy stage-based** (``_react_facts.json``): flat stages with facts.
+
+    Usage tracking (graph mode):
+    - A node is ``not_used`` until it has been referenced by the planner.
+    - A node is ``fully_used`` once referenced (since v5 evidence is a single item).
+    - Fully used nodes are **omitted** from the planner input.
+    - A node is only **available** (shown to the planner) when:
+      (a) it has no preconditions, OR
+      (b) ALL of its precondition nodes are ``fully_used``.
+    - This enforces DAG ordering: downstream nodes only become visible
+      once their upstream dependencies have been fully consumed.
+
+    Planner references facts using node IDs (e.g. ``"f1"``, ``"b2"``, ``"e3"``).
+    """
+
+    # Categories ordered by investigation workflow
+    _CATEGORY_ORDER = [
+        'fact',
+        'bridge_fact',
+        'organizational_fact',
+        'plan_fact',
+        'edit_step',
+        'validation_step',
+        # Legacy v3 categories (kept for backward compat)
+        'trigger',
+        'base_fact',
+    ]
+
+    _CATEGORY_LABELS = {
+        'fact': 'Facts',
+        'bridge_fact': 'Bridge Facts (discovered during investigation)',
+        'organizational_fact': 'Organizational Facts (synthesis)',
+        'plan_fact': 'Plan',
+        'edit_step': 'Edit Steps',
+        'validation_step': 'Validation Steps',
+        # Legacy v3 labels
+        'trigger': 'Triggers (initial observations)',
+        'base_fact': 'Base Facts (established knowledge)',
+    }
+
+    # Categories that represent investigation (must be consumed before implementation)
+    _INVESTIGATION_CATEGORIES = {'fact', 'bridge_fact', 'trigger', 'base_fact'}
+    # Categories that represent implementation (unlocked after investigation is done)
+    _IMPLEMENTATION_CATEGORIES = {'organizational_fact', 'plan_fact', 'edit_step', 'validation_step'}
 
     def __init__(self, react_facts_data: dict | None) -> None:
-        self._facts: dict[str, dict] = {}
+        self._nodes: dict[str, dict] = {}
+        # Simple boolean usage: True = used, False = not used
         self._used: dict[str, bool] = {}
-        if react_facts_data and 'stages' in react_facts_data:
-            self._load_facts(react_facts_data['stages'])
+        self._is_graph_mode = False
 
-    def _load_facts(self, stages: list[dict]) -> None:
+        if react_facts_data:
+            if 'graph' in react_facts_data:
+                self._load_graph(react_facts_data['graph'])
+                self._is_graph_mode = True
+            elif 'stages' in react_facts_data:
+                self._load_legacy(react_facts_data['stages'])
+
+    # ------------------------------------------------------------------
+    # Loaders
+    # ------------------------------------------------------------------
+
+    def _load_graph(self, graph: list[dict]) -> None:
+        """Load nodes from graph-based format (stage2 or stage3).
+
+        Handles two evidence shapes:
+        - **v5** (stage3_bridged.json): ``evidence`` is a **single dict**
+          ``{action, observation}`` — normalised into a 1-element list.
+        - **v3** (stage2_facts.json): ``evidence`` is an **array** of
+          ``{reasoning, action, observation}`` dicts.
+        """
+        for node in graph:
+            node_id = node.get('id', '')
+            if not node_id:
+                continue
+
+            raw_evidence = node.get('evidence', [])
+            # Normalise evidence to a list for uniform handling
+            if isinstance(raw_evidence, dict):
+                evidence = [raw_evidence]
+            elif isinstance(raw_evidence, list):
+                evidence = raw_evidence
+            else:
+                evidence = []
+
+            self._nodes[node_id] = {
+                'id': node_id,
+                'category': node.get('category', 'unknown'),
+                'statement': node.get('statement', ''),
+                'preconditions': node.get('preconditions', []),
+                'evidence': evidence,
+                # Fields present across versions
+                'kind': node.get('kind', ''),
+                'title': node.get('title', ''),
+                'intention_group': node.get('intention_group', ''),
+                'file': node.get('file', ''),
+                # v5 fields
+                'is_root': node.get('is_root', False),
+                'grounding': node.get('grounding', ''),
+                'motivation': node.get('motivation', ''),
+                'discovery_type': node.get('discovery_type', ''),
+            }
+            self._used[node_id] = False
+
+        logger.info(
+            f'[ReactFactTracker] Loaded graph with {len(self._nodes)} nodes.'
+        )
+
+    def _load_legacy(self, stages: list[dict]) -> None:
+        """Load from the legacy stages-based format, internally converting
+        each fact into a graph-compatible node with a single evidence item."""
         for stage_data in stages:
             stage = stage_data.get('stage', 'unknown')
             goal = stage_data.get('goal', '')
             facts = stage_data.get('facts', [])
             for idx, fact_data in enumerate(facts):
                 fact_id = f'{stage}_{idx}'
-                self._facts[fact_id] = {
-                    'fact_id': fact_id,
-                    'stage': stage,
-                    'goal': goal,
-                    'fact': fact_data.get('fact', ''),
+                rao = fact_data.get('reasoning_action_observation', {})
+                evidence = []
+                if rao:
+                    evidence = [{
+                        'reasoning': rao.get('reasoning', ''),
+                        'action': rao.get('action', ''),
+                        'observation': rao.get('observation', ''),
+                    }]
+                self._nodes[fact_id] = {
+                    'id': fact_id,
+                    'category': 'base_fact',
+                    'statement': fact_data.get('fact', ''),
                     'preconditions': fact_data.get('preconditions', []),
-                    'reasoning': fact_data.get('reasoning_action_observation', {}).get('reasoning', ''),
-                    'action': fact_data.get('reasoning_action_observation', {}).get('action', ''),
-                    'observation': fact_data.get('reasoning_action_observation', {}).get('observation', ''),
+                    'evidence': evidence,
+                    'kind': '',
+                    'title': '',
+                    'intention_group': '',
+                    'file': '',
+                    'verification': '',
+                    # Legacy fields
+                    '_legacy_stage': stage,
+                    '_legacy_goal': goal,
                 }
                 self._used[fact_id] = False
 
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
     @property
     def has_facts(self) -> bool:
-        return len(self._facts) > 0
+        return len(self._nodes) > 0
 
-    def get_available_facts(self) -> list[dict]:
-        """Return list of unused facts."""
-        return [f for fid, f in self._facts.items() if not self._used[fid]]
+    @property
+    def is_graph_mode(self) -> bool:
+        return self._is_graph_mode
+
+    # ------------------------------------------------------------------
+    # Node usage state
+    # ------------------------------------------------------------------
+
+    def _is_used(self, node_id: str) -> bool:
+        """Return True if the node has been consumed."""
+        return self._used.get(node_id, True)
+
+    def _preconditions_satisfied(self, node_id: str) -> bool:
+        """Check if all precondition nodes of *node_id* are fully_used.
+
+        In graph mode, preconditions are node IDs.  A node is available only
+        when every precondition node is ``fully_used``.  Nodes with no
+        preconditions are always satisfied.  Unknown precondition IDs are
+        treated as satisfied (graceful degradation).
+        """
+        node = self._nodes.get(node_id)
+        if not node:
+            return False
+        preconditions = node.get('preconditions', [])
+        if not preconditions:
+            return True
+        if not self._is_graph_mode:
+            # Legacy format: preconditions are free-text strings, not node IDs.
+            # We cannot check them programmatically, so treat as satisfied.
+            return True
+        for pre_id in preconditions:
+            if pre_id not in self._nodes:
+                # Unknown node — treat as satisfied to avoid blocking
+                continue
+            if not self._is_used(pre_id):
+                return False
+        return True
+
+    def _all_investigation_done(self) -> bool:
+        """Return True if all investigation-category nodes have been consumed.
+
+        Investigation categories: fact, bridge_fact (and legacy trigger, base_fact).
+        Once all of these are consumed, implementation nodes (organizational_fact,
+        plan_fact, edit_step, validation_step) are unlocked without precondition checks.
+        """
+        for nid, node in self._nodes.items():
+            if node['category'] in self._INVESTIGATION_CATEGORIES and not self._is_used(nid):
+                return False
+        return True
+
+    def get_available_nodes(self) -> list[dict]:
+        """Return nodes that are ready for the planner.
+
+        A node is available when:
+        1. It is NOT used, AND
+        2. Either:
+           a. All of its precondition nodes are used (normal DAG gating), OR
+           b. All investigation facts are done — in which case ALL remaining
+              implementation nodes become available without precondition checks.
+        """
+        investigation_done = self._all_investigation_done()
+        return [
+            n for nid, n in self._nodes.items()
+            if not self._is_used(nid)
+            and (
+                investigation_done  # bypass preconditions once investigation is complete
+                or self._preconditions_satisfied(nid)
+            )
+        ]
 
     def get_all_fact_ids(self) -> list[str]:
-        return list(self._facts.keys())
+        return list(self._nodes.keys())
 
-    def mark_facts_used(self, fact_ids: list[str]) -> None:
-        for fid in fact_ids:
-            if fid in self._used:
-                self._used[fid] = True
-                logger.info(f'[ReactFactTracker] Marked fact {fid} as used.')
-            else:
-                logger.warning(f'[ReactFactTracker] Unknown fact id: {fid}')
+    # ------------------------------------------------------------------
+    # Usage marking
+    # ------------------------------------------------------------------
+
+    def mark_facts_used(self, fact_ids: list[str], step_index: int | None = None) -> None:
+        """Mark facts as used.  Accepts plain node IDs (e.g. ``"f1"``).
+
+        Already-used nodes are silently skipped to avoid duplicate log noise.
+        """
+        step_label = f' (step {step_index})' if step_index is not None else ''
+        for ref in fact_ids:
+            node_id, _ = self._parse_fact_ref(ref)
+            if node_id not in self._nodes:
+                logger.warning(f'[ReactFactTracker] Unknown node id: {node_id} (from ref "{ref}")')
+                continue
+            if self._used[node_id]:
+                # Already used — skip silently (fixes duplicate-marking bug)
+                continue
+            self._used[node_id] = True
+            logger.info(f'[ReactFactTracker] Marked {node_id} as used{step_label}.')
+
+    @staticmethod
+    def _parse_fact_ref(ref: str) -> tuple[str, int | None]:
+        """Parse a fact reference like ``"t1:0"`` into ``("t1", 0)``
+        or ``"t1"`` into ``("t1", None)``."""
+        if ':' in ref:
+            parts = ref.rsplit(':', 1)
+            try:
+                return parts[0], int(parts[1])
+            except (ValueError, IndexError):
+                return ref, None
+        return ref, None
+
+    # ------------------------------------------------------------------
+    # Preconditions retrieval
+    # ------------------------------------------------------------------
 
     def get_preconditions_for_facts(self, fact_ids: list[str]) -> list[dict]:
-        """Return fact info with preconditions for specified fact IDs."""
-        result = []
-        for fid in fact_ids:
-            if fid in self._facts:
-                f = self._facts[fid]
+        """Return precondition info for the referenced facts.
+
+        For graph mode, preconditions are node IDs — we resolve them to
+        include the statement text for richer context in the critic prompt.
+        """
+        seen_nodes: set[str] = set()
+        result: list[dict] = []
+
+        for ref in fact_ids:
+            node_id, _ = self._parse_fact_ref(ref)
+            if node_id in seen_nodes or node_id not in self._nodes:
+                continue
+            seen_nodes.add(node_id)
+
+            node = self._nodes[node_id]
+            precondition_ids = node['preconditions']
+            statement = node['statement']
+
+            if self._is_graph_mode:
+                # Resolve precondition node IDs to their statements
+                resolved_preconditions = []
+                for pre_id in precondition_ids:
+                    pre_node = self._nodes.get(pre_id)
+                    if pre_node:
+                        resolved_preconditions.append(
+                            f'[{pre_id}] ({pre_node["category"]}): '
+                            f'{pre_node["statement"][:200]}'
+                        )
+                    else:
+                        resolved_preconditions.append(f'[{pre_id}] (unknown node)')
+
                 result.append({
-                    'fact_id': fid,
-                    'stage': f['stage'],
-                    'fact_summary': f['fact'][:200] + '...' if len(f['fact']) > 200 else f['fact'],
-                    'preconditions': f['preconditions'],
+                    'fact_id': node_id,
+                    'category': node['category'],
+                    'fact_summary': (
+                        statement[:200] + '...'
+                        if len(statement) > 200
+                        else statement
+                    ),
+                    'preconditions': resolved_preconditions,
+                    'precondition_ids': precondition_ids,
                 })
+            else:
+                # Legacy format: preconditions are already string descriptions
+                result.append({
+                    'fact_id': node_id,
+                    'category': node['category'],
+                    'fact_summary': (
+                        statement[:200] + '...'
+                        if len(statement) > 200
+                        else statement
+                    ),
+                    'preconditions': precondition_ids,
+                })
+
         return result
 
-    def render_available_facts_text(self) -> str:
-        """Render unused facts as structured text for the planner prompt."""
-        available = self.get_available_facts()
-        if not available:
-            return '(All facts have been used in previous steps.)'
+    # ------------------------------------------------------------------
+    # Rendering for planner prompt
+    # ------------------------------------------------------------------
 
-        # Group by stage
+    @property
+    def all_facts_consumed(self) -> bool:
+        """Return True if every node in the graph has been consumed."""
+        return all(self._used.values())
+
+    def get_phase_stats(self) -> dict[str, Any]:
+        """Return per-phase consumption statistics for graduated guidance.
+
+        Returns a dict with:
+        - investigation: {total, used, remaining, done}
+        - implementation: {total, used, remaining, done}
+        -   edit: {total, used, remaining, done}
+        -   validation: {total, used, remaining, done}
+        - overall_pct: int (0-100, percentage of all nodes consumed)
+        """
+        inv_total = inv_used = 0
+        impl_total = impl_used = 0
+        edit_total = edit_used = 0
+        val_total = val_used = 0
+
+        for nid, node in self._nodes.items():
+            cat = node['category']
+            used = self._is_used(nid)
+            if cat in self._INVESTIGATION_CATEGORIES:
+                inv_total += 1
+                if used:
+                    inv_used += 1
+            elif cat in self._IMPLEMENTATION_CATEGORIES:
+                impl_total += 1
+                if used:
+                    impl_used += 1
+                if cat == 'edit_step':
+                    edit_total += 1
+                    if used:
+                        edit_used += 1
+                elif cat == 'validation_step':
+                    val_total += 1
+                    if used:
+                        val_used += 1
+
+        total = len(self._nodes)
+        total_used = sum(1 for v in self._used.values() if v)
+        overall_pct = int(100 * total_used / total) if total > 0 else 0
+
+        return {
+            'investigation': {
+                'total': inv_total, 'used': inv_used,
+                'remaining': inv_total - inv_used,
+                'done': inv_total > 0 and inv_used >= inv_total,
+            },
+            'implementation': {
+                'total': impl_total, 'used': impl_used,
+                'remaining': impl_total - impl_used,
+                'done': impl_total > 0 and impl_used >= impl_total,
+            },
+            'edit': {
+                'total': edit_total, 'used': edit_used,
+                'remaining': edit_total - edit_used,
+                'done': edit_total == 0 or edit_used >= edit_total,
+            },
+            'validation': {
+                'total': val_total, 'used': val_used,
+                'remaining': val_total - val_used,
+                'done': val_total == 0 or val_used >= val_total,
+            },
+            'overall_pct': overall_pct,
+            'total': total,
+            'total_used': total_used,
+        }
+
+    def render_available_facts_text(self) -> str:
+        """Render non-fully-used nodes as structured text for the planner prompt."""
+        available = self.get_available_nodes()
+        if not available:
+            if self.all_facts_consumed:
+                return '(All facts have been fully consumed in previous steps.)'
+            else:
+                return '(No facts currently available — some remain blocked by unsatisfied preconditions.)'
+
+        if self._is_graph_mode:
+            return self._render_graph_facts(available)
+        else:
+            return self._render_legacy_facts(available)
+
+    def _render_graph_facts(self, available: list[dict]) -> str:
+        """Render graph-based facts grouped by category."""
+        # Group by category
+        by_category: dict[str, list[dict]] = {}
+        for node in available:
+            cat = node['category']
+            if cat not in by_category:
+                by_category[cat] = []
+            by_category[cat].append(node)
+
+        lines: list[str] = []
+        for cat in self._CATEGORY_ORDER:
+            if cat not in by_category:
+                continue
+            nodes = by_category[cat]
+            label = self._CATEGORY_LABELS.get(cat, cat)
+            lines.append(f'### {label}')
+            lines.append('')
+
+            for node in nodes:
+                node_id = node['id']
+                # Nodes shown here are always not-yet-used (available = !used + preconditions met)
+                state_marker = ''
+
+                # Header line with ID, optional kind/title
+                header = f'**[{node_id}]**{state_marker}'
+                if node.get('title'):
+                    header += f' — {node["title"]}'
+                if node.get('kind'):
+                    header += f' ({node["kind"]})'
+                if node.get('discovery_type'):
+                    header += f' [discovered via: {node["discovery_type"]}]'
+                lines.append(header)
+
+                # Statement
+                lines.append(f'  Statement: {node["statement"]}')
+
+                # Motivation (v5 field — explains why this fact matters)
+                if node.get('motivation'):
+                    lines.append(f'  Motivation: {node["motivation"]}')
+
+                # Preconditions (as node ID references)
+                if node['preconditions']:
+                    lines.append('  Preconditions: ' + ', '.join(
+                        f'[{pid}]' for pid in node['preconditions']
+                    ))
+
+                # File (for edit_steps)
+                if node.get('file'):
+                    lines.append(f'  File: {node["file"]}')
+
+                # Evidence (single item per node in v5, possibly array in v3)
+                evidence = node.get('evidence', [])
+                for ev in evidence:
+                    if ev.get('reasoning'):
+                        lines.append(f'  Reasoning: {ev["reasoning"]}')
+                    if ev.get('action'):
+                        lines.append(f'  Action: {ev["action"]}')
+                    if ev.get('observation'):
+                        lines.append(f'  Expected observation: {ev["observation"]}')
+
+                lines.append('')
+
+        return '\n'.join(lines).strip()
+
+    def _render_legacy_facts(self, available: list[dict]) -> str:
+        """Render legacy stage-based facts (backward compat)."""
         by_stage: dict[str, list[dict]] = {}
         for f in available:
-            stage = f['stage']
+            stage = f.get('_legacy_stage', f.get('category', 'unknown'))
             if stage not in by_stage:
                 by_stage[stage] = []
             by_stage[stage].append(f)
 
         lines: list[str] = []
         for stage, facts in by_stage.items():
-            goal = facts[0]['goal'] if facts else ''
+            goal = facts[0].get('_legacy_goal', '') if facts else ''
             lines.append(f'### Stage: {stage}')
             if goal:
                 lines.append(f'Goal: {goal}')
             lines.append('')
             for f in facts:
-                lines.append(f'**[{f["fact_id"]}]** {f["fact"]}')
+                fid = f['id']
+                lines.append(f'**[{fid}]** {f["statement"]}')
                 if f['preconditions']:
                     lines.append('  Preconditions:')
                     for pc in f['preconditions']:
                         lines.append(f'    - {pc}')
-                if f['reasoning']:
-                    lines.append(f'  Recommended reasoning: {f["reasoning"]}')
-                if f['action']:
-                    lines.append(f'  Recommended action: {f["action"]}')
+                evidence = f.get('evidence', [])
+                for eidx, ev in enumerate(evidence):
+                    if ev.get('reasoning'):
+                        lines.append(f'  Recommended reasoning: {ev["reasoning"]}')
+                    if ev.get('action'):
+                        lines.append(f'  Recommended action: {ev["action"]}')
                 lines.append('')
         return '\n'.join(lines).strip()
 
+    # ------------------------------------------------------------------
+    # Usage summary
+    # ------------------------------------------------------------------
+
     def get_usage_summary(self) -> dict:
-        total = len(self._facts)
+        total = len(self._nodes)
         used = sum(1 for v in self._used.values() if v)
+        not_used = total - used
+        investigation_done = self._all_investigation_done()
+
+        available = len(self.get_available_nodes())
+        blocked = not_used - available
+
         return {
+            'total_nodes': total,
+            'used_nodes': used,
+            'not_used_nodes': not_used,
+            'available_nodes': available,
+            'blocked_nodes': blocked,
+            'investigation_done': investigation_done,
+            'used_ids': [nid for nid, v in self._used.items() if v],
+            # Back-compat fields
             'total_facts': total,
             'used_facts': used,
-            'remaining_facts': total - used,
-            'used_fact_ids': [fid for fid, v in self._used.items() if v],
+            'remaining_facts': not_used,
+            'used_fact_ids': [nid for nid, v in self._used.items() if v],
         }
 
 
@@ -160,12 +597,14 @@ class OraclePlanner:
         oracle_context: str,
         tool_descriptions: str = '',
         react_fact_tracker: ReactFactTracker | None = None,
+        prompt_config: Any | None = None,
     ) -> None:
         self.llm = llm
         self.issue_text = issue_text
         self.oracle_context = oracle_context
         self.tool_descriptions = tool_descriptions
         self.react_fact_tracker = react_fact_tracker
+        self.prompt_config = prompt_config
         self.max_json_parse_retries = max(
             int(os.environ.get('ORACLE_PLANNER_JSON_PARSE_MAX_RETRIES', '3')),
             0,
@@ -175,6 +614,43 @@ class OraclePlanner:
             trim_blocks=True,
             lstrip_blocks=True,
         )
+        # Track accepted decisions for continuity across steps
+        self._decision_history: list[dict] = []
+
+    def record_accepted_decision(self, decision: 'PlannerDecision') -> None:
+        """Record an accepted planner decision for continuity in future prompts."""
+        entry: dict[str, Any] = {
+            'step': decision.step_index,
+            'decision': decision.decision,
+            'reason': decision.reason,
+            'consumed_facts': decision.referenced_fact_ids,
+        }
+        if decision.decision == 'proposal':
+            # Extract a meaningful summary from the proposal text
+            text = decision.proposal_response_text.strip()
+            # Use the first sentence or first 300 chars, whichever is shorter
+            dot_pos = text.find('. ')
+            if 0 < dot_pos < 300:
+                entry['proposal_summary'] = text[:dot_pos + 1]
+            else:
+                entry['proposal_summary'] = text[:300].rstrip() + ('...' if len(text) > 300 else '')
+        self._decision_history.append(entry)
+
+    def _render_decision_history(self, max_entries: int = 8) -> str:
+        """Render recent accepted decisions as text for the prompt."""
+        if not self._decision_history:
+            return ''
+        recent = self._decision_history[-max_entries:]
+        lines: list[str] = []
+        for d in recent:
+            consumed = ', '.join(d['consumed_facts']) if d['consumed_facts'] else 'none'
+            reason = d['reason']
+            if d['decision'] == 'candidate':
+                lines.append(f"- **Step {d['step']}** selected candidate (consumed: {consumed})\n  Reason: {reason}")
+            else:
+                summary = d.get('proposal_summary', '(proposal)')
+                lines.append(f"- **Step {d['step']}** proposed (consumed: {consumed})\n  Action: {summary}\n  Reason: {reason}")
+        return '\n'.join(lines)
 
     def plan(
         self,
@@ -189,6 +665,33 @@ class OraclePlanner:
             history_text=history_text,
             candidates=candidates,
             planner_feedback=planner_feedback,
+        )
+
+        # Log prompt composition breakdown (approx tokens = chars / 4)
+        est_tokens = len(prompt) // 4
+        section_chars = {
+            'issue': len(self.issue_text),
+            'oracle_context': len(self.oracle_context),
+            'history': len(history_text),
+            'candidates': sum(len(c) for c in candidates),
+            'facts': len(self.react_fact_tracker.render_available_facts_text()) if self.react_fact_tracker and self.react_fact_tracker.has_facts else 0,
+            'tools': len(self.tool_descriptions),
+            'feedback': len(planner_feedback),
+        }
+        section_tokens = {k: v // 4 for k, v in section_chars.items()}
+        template_overhead = est_tokens - sum(section_tokens.values())
+        section_tokens['template_rules'] = max(template_overhead, 0)
+
+        logger.info(
+            f'[OraclePlanner] Step {step_index} prompt: ~{est_tokens} tokens | '
+            f'issue={section_tokens["issue"]}, '
+            f'oracle={section_tokens["oracle_context"]}, '
+            f'history={section_tokens["history"]}, '
+            f'candidates={section_tokens["candidates"]}, '
+            f'facts={section_tokens["facts"]}, '
+            f'tools={section_tokens["tools"]}, '
+            f'feedback={section_tokens["feedback"]}, '
+            f'template={section_tokens["template_rules"]}'
         )
 
         for parse_retry in range(self.max_json_parse_retries + 1):
@@ -249,9 +752,21 @@ class OraclePlanner:
     ) -> str:
         available_facts_text = ''
         has_react_facts = False
+        all_facts_consumed = False
+        phase_stats = None
         if self.react_fact_tracker and self.react_fact_tracker.has_facts:
             available_facts_text = self.react_fact_tracker.render_available_facts_text()
             has_react_facts = True
+            all_facts_consumed = self.react_fact_tracker.all_facts_consumed
+            phase_stats = self.react_fact_tracker.get_phase_stats()
+
+        # Resolve prompt section flags from config (with defaults)
+        pc = self.prompt_config
+        show_tool_descriptions = getattr(pc, 'include_tool_descriptions', True) if pc else True
+        show_fact_usage_rules = getattr(pc, 'include_fact_usage_rules', True) if pc else True
+        show_finalize_guidance = getattr(pc, 'include_finalize_guidance', True) if pc else True
+        show_proposal_format = getattr(pc, 'include_proposal_format', True) if pc else True
+        show_workflow_guidelines = getattr(pc, 'include_workflow_guidelines', True) if pc else True
 
         template = self._jinja_env.get_template('planner_select_or_propose.j2')
         return template.render(
@@ -261,9 +776,16 @@ class OraclePlanner:
             history_text=history_text,
             candidates=candidates,
             planner_feedback=planner_feedback,
-            tool_descriptions=self.tool_descriptions,
+            tool_descriptions=self.tool_descriptions if show_tool_descriptions else '',
             available_facts_text=available_facts_text,
             has_react_facts=has_react_facts,
+            all_facts_consumed=all_facts_consumed,
+            show_fact_usage_rules=show_fact_usage_rules,
+            show_finalize_guidance=show_finalize_guidance,
+            show_proposal_format=show_proposal_format,
+            show_workflow_guidelines=show_workflow_guidelines,
+            decision_history_text=self._render_decision_history(),
+            phase_stats=phase_stats,
         )
 
     @staticmethod
@@ -416,6 +938,7 @@ class OraclePlanner:
         oracle_context: str,
         tool_descriptions: str = '',
         react_fact_tracker: ReactFactTracker | None = None,
+        prompt_config: Any | None = None,
     ) -> 'OraclePlanner | None':
         from openhands.core.config.utils import get_llm_config_arg
 
@@ -450,4 +973,5 @@ class OraclePlanner:
             oracle_context=oracle_context,
             tool_descriptions=tool_descriptions,
             react_fact_tracker=react_fact_tracker,
+            prompt_config=prompt_config,
         )

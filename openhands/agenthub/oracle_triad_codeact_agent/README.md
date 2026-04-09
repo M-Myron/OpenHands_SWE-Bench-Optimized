@@ -100,7 +100,7 @@ The oracle-aware component. Has full access to the ground-truth patch, test patc
 **Key classes:**
 - `OraclePlanner` — renders `planner_select_or_propose.j2`, returns a `PlannerDecision`
 - `PlannerDecision` — dataclass with `decision` (`'candidate'` or `'proposal'`), selected index, proposal text, referenced fact IDs
-- `ReactFactTracker` — manages structured investigation facts from preprocessing; tracks which facts have been used to avoid repetition
+- `ReactFactTracker` — manages structured investigation facts as a DAG; supports bridged graph (`stage3_bridged.json`, v5), stage-2 graph (`stage2_facts.json`, v3), and legacy (`_react_facts.json`) formats; enforces precondition-gated availability
 
 ### Proposal Validators
 
@@ -123,10 +123,10 @@ Returns a `VerificationVerdict` with `.valid` property for backward compatibilit
 
 | Family | Focus | Severity | Rules |
 |--------|-------|----------|-------|
-| **A** — Workflow | Phase ordering enforcement | High | A1: edit needs analysis, A2: verify needs implementation, A3: finalize needs verification, A4: phase evidence |
-| **B** — Reachability | File/symbol discoverability | High/Medium | B1: file path justification, B2: symbol justification, B3: edit target read, B4: symbol definition |
+| **A** — Workflow | *(Removed — caused false rejections)* | — | — |
+| **B** — Reachability | File/symbol discoverability | High/Medium | B1: file path justification, B2: symbol justification, B3: edit target read, B4: action parameters |
 | **C** — Leakage | Oracle knowledge detection | High | C1: hidden implementation detail, C2: unsupported localization, C3: oracle-only dependence |
-| **D** — Evidence | Claim support adequacy | Medium | D1: bug cause support, D2: fix claim support |
+| **D** — Evidence | Claim support adequacy | Medium | D1: bug cause support, D2: fix claim support, D3: analysis support, D4: fact prerequisites visible |
 | **E** — Discoverability | Advisory suggestions | Low | E1: discoverable next step, E2: missing prerequisite |
 
 #### OracleProposalCritic (legacy)
@@ -157,6 +157,7 @@ Simpler but less interpretable — the LLM produces a `valid: true/false` judgme
 |----------|---------|-------------|
 | `BLINDED_DEBUGGER_NUM_CANDIDATES` | `3` | Number of candidate responses per step |
 | `ORACLE_PLANNER_MAX_RETRIES` | `2` | Max planner retry attempts on proposal rejection |
+| `ORACLE_PLANNER_HISTORY_WINDOW` | `5` | Number of recent action steps shown to planner. `-1` or `0` = full history |
 | `PROPOSAL_VALIDATOR` | `verifier` | Validator backend: `verifier`, `critic`, or `none` |
 | `USE_LEGACY_CRITIC` | `0` | Legacy compat — set to `1` as shorthand for `PROPOSAL_VALIDATOR=critic` |
 
@@ -181,7 +182,7 @@ Simpler but less interpretable — the LLM produces a `valid: true/false` judgme
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ORACLE_PLANNER_CONTEXT_PATH` | *(empty)* | Path to JSON with oracle context (patch, tests, analysis, react facts) |
-| `ORACLE_PREPROCESS_DIR` | *(empty)* | Directory with `{instance_id}_analysis.md` and `{instance_id}_react_facts.json` |
+| `ORACLE_PREPROCESS_DIR` | *(empty)* | Directory with `{instance_id}/stage3_bridged.json` (v5), `{instance_id}/stage2_facts.json` (v3), or `{instance_id}_react_facts.json` (legacy) |
 
 #### Prompt Saving
 
@@ -244,7 +245,7 @@ When `PROPOSAL_VALIDATOR` is set, it takes precedence. If unset, `USE_LEGACY_CRI
 |--------|-----------|---------|
 | Method | 4-stage pipeline with symbolic rules | Single LLM prompt |
 | Interpretability | Structured: rule IDs, claim IDs, evidence trails | Free-text reason |
-| LLM calls | 0–2 per validation (extraction + optional synthesis) | 1 per validation |
+| LLM calls | 1–3 per validation (extraction + batched resolution + optional synthesis) | 1 per validation |
 | Deterministic rules | 14 rules across 5 families | None (LLM-only) |
 | Feedback quality | Structured with specific rule violations and suggestions | Free-text |
 | Oracle isolation | No filesystem, no shell, history-only retrieval | Prompt-based |
@@ -330,29 +331,67 @@ Optional flags: `--eval-n-limit <N>`, `--instance-ids <id1,id2,...>`
 The planner requires an oracle context JSON file per instance. The eval runner creates this automatically from dataset columns, but you can also provide preprocessed analysis:
 
 ```bash
-# Precomputed analysis directory structure:
+# Precomputed analysis directory structure (bridged graph — v5):
+ORACLE_PREPROCESS_DIR=/path/to/preprocess/swegym_v5/
+#   ├── bokeh__bokeh-12779/
+#   │   └── stage3_bridged.json       (bridged investigation DAG with fact/bridge_fact nodes)
+#   └── getmoto__moto-7365/
+#       └── stage3_bridged.json
+
+# Stage-2 graph layout (v3):
+ORACLE_PREPROCESS_DIR=/path/to/preprocess/swegym_v3/
+#   ├── bokeh__bokeh-12779/
+#   │   └── stage2_facts.json         (graph DAG with trigger/base_fact nodes)
+#   └── ...
+
+# Legacy flat layout:
 ORACLE_PREPROCESS_DIR=/path/to/preprocess/
 #   ├── django__django-12663_analysis.md      (deep analysis markdown)
 #   └── django__django-12663_react_facts.json (structured investigation facts)
 ```
 
-**React facts JSON format:**
+**Bridged graph format (`stage3_bridged.json` — v5, recommended):**
 ```json
 {
-  "facts": [
+  "instance_id": "bokeh__bokeh-12779",
+  "intention_groups": [...],
+  "graph": [
     {
-      "fact_id": "f1",
-      "stage": "exploration",
-      "goal": "Find the file containing the bug",
-      "fact": "The bug is in django/core/management/commands/shell.py",
-      "preconditions": ["The file exists in the repo"],
-      "reasoning": "grep found the relevant code",
-      "action": "grep -rn 'shell' django/core/management/",
-      "observation": "Found match at line 42"
+      "id": "f1",
+      "category": "fact",
+      "kind": "requirement_fact",
+      "is_root": true,
+      "grounding": "problem_rooted",
+      "statement": "Problem reports ResourceWarning...",
+      "motivation": "The problem statement is the primary input.",
+      "preconditions": [],
+      "evidence": {
+        "action": "[view] problem_statement",
+        "observation": "Identifies directory.py:126..."
+      }
+    },
+    {
+      "id": "b1",
+      "category": "bridge_fact",
+      "discovery_type": "proactive_exploration",
+      "statement": "Developer scans examples and discovers scipy.misc...",
+      "preconditions": ["f10"],
+      "evidence": {...}
     }
-  ]
+  ],
+  "bridge_summary": {...},
+  "derivation_frontier": ["f1", "f2", ...]
 }
 ```
+
+**Key properties:**
+- Node categories: `fact`, `bridge_fact`, `organizational_fact`, `plan_fact`, `edit_step`, `validation_step`
+- `preconditions` are node IDs forming a DAG — a node is only shown to the planner when all its preconditions are fully consumed
+- `evidence` is a single dict `{action, observation}` (v5) or an array (v3)
+- `is_root` marks entry-point nodes (no preconditions)
+- `grounding` indicates whether the fact is `problem_rooted`, `bridged`, or `non_problem_rooted`
+- `bridge_fact` nodes have a `discovery_type` hint (`proactive_exploration`, `structural_browsing`)
+- The loader tries `stage3_bridged.json` first, then `stage2_facts.json`, then legacy `_react_facts.json`
 
 ---
 
@@ -408,6 +447,7 @@ Located in `prompts/`:
 | `planner_select_or_propose.j2` | `OraclePlanner` | Ask planner to select a candidate or propose a revised response |
 | `validate_oracle_proposal.j2` | `OracleProposalCritic` | Ask critic to judge proposal groundedness and leakage |
 | `extract_claims.j2` | `ClaimExtractor` | Ask LLM to decompose proposal into structured claims and retrieval plan |
+| `resolve_rules_batch.j2` | `HistoryGroundedVerifier` | Adjudicate all failing symbolic rules in a single batched LLM call |
 | `synthesize_verdict.j2` | `HistoryGroundedVerifier` | Ask LLM to resolve ambiguous leakage cases |
 
 ---
@@ -424,7 +464,8 @@ Each step produces structured log entries saved to `{eval_output_dir}/oracle_tri
 {"step_index": 5, "event": "verifier_verdict", "attempt": 0, "verdict": "invalid", "reason": "...", "rule_results": [...]}
 {"step_index": 5, "event": "oracle_planner_decision", "attempt": 1, "decision": "proposal", "reason": "...", ...}
 {"step_index": 5, "event": "verifier_verdict", "attempt": 1, "verdict": "valid", ...}
-{"step_index": 5, "event": "react_fact_usage_summary", "total_facts": 8, "used_facts": 3, ...}
+{"step_index": 5, "event": "react_fact_usage_summary", "total_nodes": 45, "used_nodes": 5, "available_nodes": 9, "blocked_nodes": 31, ...}
+{"step_index": 5, "event": "step_timing", "timing_seconds": {"candidates": 2.5, "planner": 7.7, "verifier": 21.3, "materialization": 1.2, "step_total": 32.7}, "llm_calls": {"candidates": 1, "planner": 1, "verifier": 2, "materialization": 1, "total": 5}}
 ```
 
 The event type depends on the selected validator:
@@ -451,5 +492,6 @@ oracle_triad_codeact_agent/
     ├── planner_select_or_propose.j2    # Planner decision prompt
     ├── validate_oracle_proposal.j2     # Legacy critic prompt
     ├── extract_claims.j2               # Claim extraction prompt (verifier Stage 1)
+    ├── resolve_rules_batch.j2          # Batched rule adjudication (verifier Stage 3.5)
     └── synthesize_verdict.j2           # Verdict synthesis prompt (verifier Stage 4)
 ```

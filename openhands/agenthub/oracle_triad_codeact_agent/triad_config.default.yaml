@@ -1,0 +1,58 @@
+# Oracle Triad Agent Configuration
+# =================================
+# Copy this file and set ORACLE_TRIAD_CONFIG=/path/to/your/config.yaml
+# Environment variables take precedence over values set here.
+
+# ---- Oracle context: which private information the planner sees ----------
+oracle_context:
+  include_golden_patch: false        # Show the ground-truth code fix
+  include_golden_test_patch: false   # Show the ground-truth test patch
+  include_issue_understanding: false # Show structured issue understanding
+  include_deep_analysis: false       # Show precomputed root-cause analysis
+  include_react_facts: true         # Load investigation graph (stage3/stage2/legacy)
+
+# ---- Planner prompt: which template sections are rendered ----------------
+planner_prompt:
+  include_tool_descriptions: true   # Show available tool catalog to the planner
+  include_fact_usage_rules: true    # Show fact selection/consumption rules
+  include_finalize_guidance: true   # Show "proceed to finish" when all facts consumed
+  include_proposal_format: true     # Show proposal format instructions
+  include_workflow_guidelines: true # Show recommended workflow phases
+
+# ---- Agent behaviour ----------------------------------------------------
+agent:
+  num_candidates: 1                 # Blinded debugger candidates per step
+  planner_max_retries: 2            # Planner proposal revision retries on rejection
+  planner_history_window: 10         # Recent action steps shown to planner (-1 = full)
+  proposal_validator: verifier      # 'verifier' | 'critic' | 'none'
+  planner_llm_config: oracle_planner        # config.toml section for planner LLM
+  critic_llm_config: blinded_critic         # config.toml section for critic/verifier LLM
+  verifier_llm_config: ""                   # config.toml section for verifier (empty = use critic)
+  planner_json_parse_max_retries: 2
+  critic_json_parse_max_retries: 2
+  verifier_programmatic_only: false         # Skip LLM claim extraction, use regex only
+  verifier_extractor_json_retries: 2
+
+# ---- Debug / prompt saving -----------------------------------------------
+debug:
+  save_planner_prompts: true        # Save planner prompts to disk
+  save_critic_prompts: true         # Save critic/verifier prompts to disk
+
+# ===========================================================================
+# Example: ablation study without golden patches
+# ===========================================================================
+# oracle_context:
+#   include_golden_patch: false
+#   include_golden_test_patch: false
+#   include_issue_understanding: true
+#   include_deep_analysis: true
+#   include_react_facts: true
+#
+# ===========================================================================
+# Example: fast mode (no verifier, 1 candidate, regex-only extraction)
+# ===========================================================================
+# agent:
+#   num_candidates: 1
+#   planner_max_retries: 1
+#   proposal_validator: none
+#   verifier_programmatic_only: true

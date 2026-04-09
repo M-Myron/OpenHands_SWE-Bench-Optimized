@@ -158,16 +158,18 @@ The planner produces a JSON response with the following schema:
 ### 4.3 React Fact Integration
 
 Each fact in the react fact set has:
-- **`fact_id`**: Unique identifier (e.g., `stage1_0`, `stage2_3`)
-- **`stage`**: Investigation phase (e.g., "Initial Exploration", "Root Cause Analysis")
-- **`goal`**: What the fact aims to achieve
-- **`fact`**: The investigative step description
-- **`preconditions`**: History states that must hold before this fact is relevant
-- **`reasoning`**: Why this step is appropriate at this stage
-- **`action`**: The concrete tool call
-- **`observation`**: Expected outcome
+- **`id`**: Unique identifier (e.g., `f1`, `f2`, `b1`, `e1`)
+- **`category`**: Node type (`fact`, `bridge_fact`, `organizational_fact`, `plan_fact`, `edit_step`, `validation_step`)
+- **`statement`**: What the fact establishes
+- **`preconditions`**: List of **node IDs** that must be `fully_used` before this node becomes available (DAG dependency)
+- **`evidence`**: Single dict `{action, observation}` (v5) or array of dicts (v3) — normalized to list internally
+- **`kind`** (fact/bridge_fact): Fact kind — `requirement_fact`, `codebase_fact`, `runtime_fact`, `inferred_fact`, `pattern_fact`
+- **`is_root`**: True for entry-point nodes (no preconditions)
+- **`grounding`**: `problem_rooted`, `bridged`, or `non_problem_rooted`
+- **`motivation`**: Why this fact was investigated / why it matters
+- **`discovery_type`** (bridge_fact only): `proactive_exploration`, `structural_browsing`
 
-Facts are presented to the planner grouped by stage. The planner declares which facts it references via `referenced_fact_ids`, enabling downstream tracking and precondition enforcement.
+Facts are presented to the planner grouped by category, but only nodes whose preconditions are all satisfied are shown. The planner declares which facts it references via `referenced_fact_ids` (e.g. `["f1", "b2"]`), enabling downstream tracking, precondition enforcement, and progressive DAG unlocking.
 
 ---
 
@@ -350,16 +352,9 @@ class RuleResult:
 
 ### 8.3 Rule Families
 
-#### Family A — Workflow Phase Ordering (Severity: High)
+#### Family A — Workflow Phase Ordering
 
-These rules enforce that the agent follows a plausible debugging workflow. All are deterministic (no LLM escalation).
-
-| Rule | Constraint | Check |
-|------|-----------|-------|
-| **A1** | Edit requires analysis | Phase 5 (`fix_analysis`) must precede Phase 6 (`fix_implementation`). Adequate analysis = `think` action with ≥80 chars matching `_ANALYSIS_INDICATORS` regex. |
-| **A2** | Verification requires implementation | Phase 7 (`verification`) must have a preceding Phase 6 edit. |
-| **A3** | Finalization requires verification | Phase 8 (`final_review`) must have a preceding test run. Detects Django-specific patterns: `runtests.py`, `manage.py test`. |
-| **A4** | Phase completion requires evidence | Claims asserting phase completion must have at least one relevant tag in history. Severity: medium. |
+**Removed.** These rules (A1–A4) enforced strict phase ordering but caused false rejections — e.g., rejecting a runtime probe as "verification before implementation". The planner prompt now provides workflow as a soft guideline instead.
 
 #### Family B — Reachability (Severity: High/Medium)
 
@@ -391,6 +386,7 @@ These rules detect oracle-derived knowledge that lacks public provenance. All th
 | **D1** | Bug-cause support | **Yes** | Reasoning claims must reference files/symbols visible in history or issue text. |
 | **D2** | Test claim support | No | Test-related claims must have corresponding `test_run` tagged units. |
 | **D3** | Analysis claim support | No | Analysis claims must have corresponding `think` tagged units. |
+| **D4** | Fact prerequisites visible | **Yes** | Prerequisites of referenced oracle facts must be visible in interaction history. Uses keyword matching (40% threshold) with LLM escalation for borderline cases. |
 
 #### Family E — Discoverability (Severity: Low, Advisory Only)
 
@@ -421,39 +417,29 @@ This two-tier strategy avoids unnecessary LLM calls for clear-cut violations whi
 
 ### 9.1 Motivation
 
-Six rules (B2, B4, C1, C2, C3, D1) involve assessments that symbolic checking cannot reliably make:
-- Can a symbol be *reasonably inferred* from visible code patterns?
-- Could a line number be *derived* from output the agent has seen?
-- Is a code snippet *derivable* from the issue description and error traces?
+Six rules (B2, B4, C1, C2, C3, D1) plus D4 involve assessments that symbolic checking cannot reliably make.
 
-Rather than accepting all ambiguous cases (high false-negative rate) or rejecting all (high false-positive rate), we escalate each to a focused LLM adjudication call with structured context.
+### 9.2 Batched Resolution Protocol
 
-### 9.2 Resolution Protocol
+All rules with `needs_llm_assist=True` are resolved in a **single batched LLM call** using the `resolve_rules_batch.j2` template:
 
-For each rule with `needs_llm_assist=True`:
+1. **Render batch prompt** with all failing rules (each with its per-rule context: `unjustified_symbols`, `unjustified_params`, `unsupported_snippets`, `oracle_dependent_claims`, `reasoning_claims`, `nearby_evidence`) plus shared evidence (proposal excerpt, issue text, retrieved history units).
 
-1. **Render `resolve_rule.j2`** with:
-   - The rule's `rule_id`, `severity`, `reason`
-   - The rule's `llm_context` (structured: `question`, `unjustified_symbols`, `unjustified_params`, `unsupported_snippets`, etc.)
-   - `proposal_text` (excerpt)
-   - `issue_text` (excerpt)
-   - `evidence_snippets` — list of retrieved units with `{unit_id, action_type, phase_hint, action_summary, text_snippet}`
-
-2. **Make a one-shot LLM call** and parse the response:
+2. **Make one LLM call** and parse the response:
    ```json
-   {"verdict": "justified | overruled", "reason": "one-sentence explanation"}
+   {"results": [
+     {"rule_id": "B2", "verdict": "overruled", "reason": "..."},
+     {"rule_id": "B4", "verdict": "justified", "reason": "..."}
+   ]}
    ```
-   - `overruled`: The symbolic failure is a false positive; the claim is actually supported. Rule flips to `passed=True`.
+   - `overruled`: The symbolic failure is a false positive. Rule flips to `passed=True`.
    - `justified`: The symbolic failure is genuine. Rule remains `passed=False`.
 
-3. **Fail-open on error**: If the LLM call fails (network, parsing), the rule defaults to `passed=True`. This is a conservative design choice that prevents infrastructure failures from blocking trajectory generation.
+3. **Retry on failure**: Up to 2 retries for LLM call failures or unparseable responses.
 
-### 9.3 Post-Resolution
+4. **Fail-open**: If all retries exhausted, or a rule is missing from the response, it defaults to `passed=True`.
 
-After all LLM-assist rules are resolved:
-- `needs_llm_assist` is cleared on all results.
-- `failed_high` is recalculated using the standard `get_failed_high()` method.
-- `uncertain` (C-family failures that survived LLM resolution) proceeds to Stage 4 for final synthesis.
+This replaces the previous per-rule sequential resolution (1–7 LLM calls) with exactly 1 call.
 
 ---
 
@@ -543,31 +529,68 @@ This feedback is forwarded to the planner via the planner prompt's `planner_feed
 
 ### 12.1 Overview
 
-`ReactFactTracker` manages a structured set of investigation facts derived from preprocessing. Each fact represents one step in a plausible investigation trajectory, complete with preconditions, reasoning, and expected observations.
+`ReactFactTracker` manages a structured set of investigation facts derived from preprocessing. It supports three data formats:
 
-### 12.2 Usage Protocol
+1. **Bridged graph** (swegym_v5 `stage3_bridged.json`): A DAG of typed nodes (`fact`, `bridge_fact`, `organizational_fact`, `plan_fact`, `edit_step`, `validation_step`) with node-ID preconditions and a **single** evidence dict `{action, observation}` per node. Includes `motivation`, `is_root`, `grounding`, and `discovery_type` fields.
+2. **Stage-2 graph** (swegym_v3 `stage2_facts.json`): Older DAG format with categories `trigger`/`base_fact` and evidence as an **array** of `{reasoning, action, observation}` dicts. Fully backward compatible.
+3. **Legacy stage-based** (`_react_facts.json`): Flat `stages[].facts[]` structure, internally converted to graph-compatible nodes.
 
-1. **Initialization**: Facts are loaded from the oracle context JSON (`react_facts` key) and assigned unique IDs (`{stage}_{index}`).
-2. **Presentation**: Available (unused) facts are rendered to the planner prompt grouped by investigation stage.
-3. **Consumption**: When the planner declares `referenced_fact_ids`, those facts are marked as used and excluded from future prompts.
-4. **Precondition Forwarding**: Referenced facts' preconditions are passed to the validator, enriching the explicit precondition set.
+### 12.2 DAG-Gated Availability
+
+In graph mode, nodes form a dependency DAG via their `preconditions` field (list of node IDs). The tracker enforces **precondition-gated availability**:
+
+- A node is **available** (shown to the planner) only when:
+  (a) it has no preconditions, OR
+  (b) ALL of its precondition nodes are `fully_used`.
+- This means downstream nodes (e.g., `fact` nodes depending on root facts) only become visible once upstream dependencies are consumed.
+- Initially, only root nodes (`is_root: true` / no preconditions) are available.
+- As the planner consumes root facts, dependent facts unlock; as those are consumed, organizational facts unlock, and so on through edit steps and validation steps.
+
+This prevents the planner from seeing the entire graph upfront and ensures a natural investigation progression.
+
+### 12.3 Usage Tracking
+
+Since v5 evidence is a single dict per node, usage is binary:
+- **`not_used`**: The node has not been referenced.
+- **`fully_used`**: The node has been referenced. It is **omitted** from the planner input and unlocks downstream nodes.
+
+(For backward compatibility with v3 multi-evidence nodes, per-evidence tracking is still supported internally.)
+
+### 12.4 Bridge Facts
+
+Bridge facts (`category: "bridge_fact"`, prefixed `b`) represent discoveries made during investigation that connect problem-rooted facts to otherwise unreachable knowledge. They include:
+- `discovery_type`: How the fact was discovered (`proactive_exploration`, `structural_browsing`)
+- `grounding`: `bridged` (connecting problem-rooted to non-problem-rooted knowledge)
+
+The `bridge_summary` top-level field provides metadata about how many facts required bridging.
+
+### 12.5 Usage Protocol
+
+1. **Initialization**: Facts are loaded from the oracle context JSON. The loader tries `stage3_bridged.json` (v5) first, then `stage2_facts.json` (v3), then legacy `_react_facts.json`. V5 single-dict evidence is normalized to a 1-element list internally.
+2. **Presentation**: Only available (precondition-satisfied, not-fully-used) nodes are rendered to the planner prompt, grouped by category. V5 nodes include `motivation` in the rendering.
+3. **Consumption**: When the planner declares `referenced_fact_ids` (e.g. `["f1", "b2"]`), those nodes are marked as used. This unlocks downstream nodes.
+4. **Precondition Forwarding**: Referenced facts' preconditions are resolved (node IDs expanded to include category + statement text) and passed to the validator.
 5. **Summary**: At the end of each step, a usage summary is logged:
    ```json
-   {"total_facts": 12, "used_facts": 4, "remaining_facts": 8, "used_fact_ids": ["stage1_0", "stage2_1", ...]}
+   {"total_nodes": 59, "fully_used_nodes": 5, "available_nodes": 7, "blocked_nodes": 47, "total_evidence": 59, "used_evidence": 5, ...}
    ```
 
-### 12.3 Fact Structure
+### 12.6 Fact Structure (v5 Bridged Format)
 
 ```json
 {
-  "fact_id": "stage2_1",
-  "stage": "Root Cause Analysis",
-  "goal": "Identify why Lookup doesn't resolve expressions",
-  "fact": "Open django/db/models/lookups.py and read the Lookup class",
-  "preconditions": ["File django/db/models/lookups.py must be visible in history"],
-  "reasoning": "Lookup class inherits Expression but may not call resolve_expression",
-  "action": "[TOOL CALL] read_file({\"path\": \"django/db/models/lookups.py\", \"view_range\": [1, 50]})",
-  "observation": "Lookup class definition with __init__ and as_sql methods"
+  "id": "f2",
+  "category": "fact",
+  "kind": "codebase_fact",
+  "is_root": false,
+  "grounding": "problem_rooted",
+  "statement": "In directory.py line 126, open(init_py).read() creates an unclosed file...",
+  "motivation": "The problem statement identifies directory.py:126 as the bug location.",
+  "preconditions": ["f1"],
+  "evidence": {
+    "action": "[view] src/bokeh/application/handlers/directory.py 115-132",
+    "observation": "Line 126: open() return value used inline without closing."
+  }
 }
 ```
 
@@ -583,7 +606,7 @@ Five Jinja2 templates orchestrate the LLM interactions:
 |----------|-------|---------|-----------|
 | `planner_select_or_propose.j2` | Planner decision | Present candidates, oracle context, react facts; request selection or proposal | 1 per step |
 | `extract_claims.j2` | Stage 1 | Decompose proposal into typed claims, preconditions, and retrieval plan | 1 (with fallback) |
-| `resolve_rule.j2` | Stage 3.5 | Adjudicate ambiguous symbolic rule failure | 0–6 per proposal |
+| `resolve_rules_batch.j2` | Stage 3.5 | Adjudicate all failing symbolic rules in a single batched call | 0–1 per proposal |
 | `synthesize_verdict.j2` | Stage 4 | Synthesize final verdict from rule results and evidence | 0–1 per proposal |
 | `validate_oracle_proposal.j2` | Legacy critic | One-shot validation (used when `PROPOSAL_VALIDATOR=critic`) | 1 per proposal |
 
@@ -613,18 +636,27 @@ All templates use `dict`-style access for `llm_context` fields (e.g., `rule.llm_
 | Stage 1 (Extraction) | 1 LLM call | ~10–15s |
 | Stage 2 (Retrieval) | O(Q × N) in-memory scans | <100ms |
 | Stage 3 (Symbolic) | O(C × R) regex/set operations | <500ms |
-| Stage 3.5 (LLM Resolution) | 0–6 LLM calls | 0–90s |
+| Stage 3.5 (Batched LLM Resolution) | 0–1 LLM call | 0–20s |
 | Stage 4 (Synthesis) | 0–1 LLM call | 0–15s |
 
-Where Q = number of retrieval queries (~8), N = history units, C = number of claims, R = number of rules (14+).
+Where Q = number of retrieval queries (~8), N = history units, C = number of claims, R = number of rules.
 
 ### 14.2 Best and Worst Case
 
 - **Best case** (deterministic reject): Stages 1–3 only → 1 LLM call, <16s
 - **Best case** (all pass, no uncertain): Stages 1–3 → 1 LLM call, <16s
-- **Worst case** (all 6 LLM-assist rules + uncertain synthesis): 1 + 6 + 1 = 8 LLM calls, ~120s
+- **Typical case** (some rules need assistance): 1 + 1 = 2 LLM calls, ~25s
+- **Worst case** (batch resolution + uncertain synthesis + retries): 1 + 1 + 1 = 3 LLM calls, ~45s
 
-In practice, most proposals trigger 1–3 LLM-assist rules, yielding 2–5 total LLM calls per validation.
+### 14.3 Planner History Windowing
+
+The planner receives a windowed view of interaction history (`ORACLE_PLANNER_HISTORY_WINDOW=5` by default):
+- Full SESSION SUMMARY (file/command inventories) is always included
+- Only the last N action-observation pairs are shown in detail
+- Earlier events are summarized as `... (N earlier events omitted)`
+- The verifier/critic always receives the full history for accurate grounding checks
+
+This bounds the planner prompt at ~6–10K history tokens instead of growing linearly with trajectory length.
 
 ### 14.3 Memory Complexity
 
@@ -652,7 +684,7 @@ The Structured History Memory holds O(N) units where N is the number of action-o
 | File | Lines | Role |
 |------|------:|------|
 | `oracle_triad_codeact_agent.py` | ~920 | Main triad orchestration agent |
-| `oracle_planner.py` | ~370 | Oracle planner + `ReactFactTracker` + `PlannerDecision` |
+| `oracle_planner.py` | ~520 | Oracle planner + `ReactFactTracker` (graph DAG + legacy) + `PlannerDecision` |
 | `proposal_critic.py` | ~260 | Legacy one-shot blinded critic |
 | `verifier.py` | ~940 | 4.5-stage verification pipeline |
 | `symbolic_rules.py` | ~1100 | Deterministic rule engine (families A–E) |
@@ -660,7 +692,8 @@ The Structured History Memory holds O(N) units where N is the number of action-o
 | `claim_extractor.py` | ~650 | Claim, precondition, and retrieval plan extraction |
 | `prompts/planner_select_or_propose.j2` | ~200 | Planner decision prompt |
 | `prompts/extract_claims.j2` | ~140 | Claim extraction prompt |
-| `prompts/resolve_rule.j2` | ~110 | LLM rule adjudication prompt |
+| `prompts/resolve_rules_batch.j2` | ~120 | Batched LLM rule adjudication prompt |
+| `prompts/resolve_rule.j2` | ~110 | Per-rule LLM adjudication (legacy, kept as reference) |
 | `prompts/synthesize_verdict.j2` | ~140 | Verdict synthesis prompt |
 | `prompts/validate_oracle_proposal.j2` | ~160 | Legacy critic prompt |
 
@@ -677,10 +710,10 @@ The Structured History Memory holds O(N) units where N is the number of action-o
 
 | ID | Family | Severity | LLM Assist | One-line Description |
 |----|--------|----------|:----------:|----------------------|
-| A1 | Workflow | High | No | Edit requires prior analysis (≥80 char think action with analysis indicators) |
-| A2 | Workflow | High | No | Verification requires prior implementation (edit) |
-| A3 | Workflow | High | No | Finalization requires prior verification (test run; detects runtests.py, manage.py test) |
-| A4 | Workflow | Medium | No | Phase completion assertions require evidence |
+| A1 | Workflow | High | No | *(Removed)* |
+| A2 | Workflow | High | No | *(Removed)* |
+| A3 | Workflow | High | No | *(Removed)* |
+| A4 | Workflow | Medium | No | *(Removed)* |
 | B1 | Reachability | High | No | File paths must be in issue text, known files, or retrieved units (exploratory exempt) |
 | B2 | Reachability | Medium | Yes | Symbols must be visible in issue or history (unjustified → LLM judgment) |
 | B3 | Reachability | High | No | Edit targets must be previously read or searched |
@@ -707,7 +740,8 @@ The Structured History Memory holds O(N) units where N is the number of action-o
 | `PROPOSAL_VALIDATOR` | `verifier` | Validation backend: `verifier` \| `critic` \| `none` |
 | `USE_LEGACY_CRITIC` | `0` | Legacy flag: `1` → `PROPOSAL_VALIDATOR=critic` |
 | `ORACLE_PLANNER_CONTEXT_PATH` | — | Path to oracle context JSON (set per instance) |
-| `ORACLE_PREPROCESS_DIR` | Auto-detect | Directory containing `{id}_react_facts.json` and `{id}_analysis.md` |
+| `ORACLE_PLANNER_HISTORY_WINDOW` | 5 | Number of recent action steps shown to planner (−0 or −1 = full history) |
+| `ORACLE_PREPROCESS_DIR` | Auto-detect | Directory containing `{id}/stage3_bridged.json` (v5), `{id}/stage2_facts.json` (v3), or `{id}_react_facts.json` (legacy) |
 | `VERIFIER_PROGRAMMATIC_ONLY` | `0` | Force programmatic claim extractor (skip LLM) |
 | `VERIFIER_EXTRACTOR_JSON_RETRIES` | 2 | LLM JSON parsing retries for claim extraction |
 | `VERIFIER_LLM_CONFIG` | Uses critic config | LLM config for verifier |

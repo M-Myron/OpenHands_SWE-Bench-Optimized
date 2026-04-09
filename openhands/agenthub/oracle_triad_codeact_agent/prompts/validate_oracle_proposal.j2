@@ -8,45 +8,41 @@ Evaluation criteria for proposal validity:
 2) Grounding in already observed information.
 3) No logic jumps that skip required exploration.
 4) No leakage of oracle-only details.
-5) Strict compliance with the base instruction events in history index:
-  - History Event 0: OpenHands system instruction.
-  - History Event 1: SWE-bench task instruction and workflow phases.
-6) Workflow phase ordering (see Phase Enforcement below).
+5) The proposal should explain **why** the action is being taken, not just what action to perform.
 {% if fact_preconditions %}
-7) Fact precondition satisfaction (see Fact Preconditions below).
+6) Fact precondition satisfaction (see Fact Preconditions below).
 {% endif %}
 
-## Workflow Phase Enforcement
-
-History Event 1 defines a mandatory phase sequence for SWE-bench tasks:
-  Phase 1 → READING → Phase 2 → RUNNING → Phase 3 → EXPLORATION → Phase 4 → TEST CREATION → Phase 5 → FIX ANALYSIS → Phase 6 → FIX IMPLEMENTATION → Phase 7 → VERIFICATION → Phase 8 → FINAL REVIEW
-
-**You MUST reject proposals that violate phase ordering. Common violations:**
-
-- **Jumping to Phase 6 (code edit / str_replace) without Phase 5 (fix analysis):** If the interaction history does NOT contain an explicit analysis step — a `think` call or detailed reasoning that states (a) what the bug is, (b) where it is located, (c) why the current code is wrong, and (d) how to fix it — then a `str_replace` / code edit proposal is a phase violation. The proposal should instead suggest a `think` tool call for Phase 5 analysis.
-
-- **Jumping to Phase 7 (verification) without Phase 6:** If no source file edit has been made yet, a "run tests to verify" proposal is premature.
-
-- **Skipping Phase 4 (test creation):** If no reproduction script has been created/run, jumping straight to analysis or editing is premature.
-
-**Why this matters:** These trajectories become SFT training data. A trajectory that jumps from "I see the code" to "let me edit it" teaches future models to skip analysis — producing brittle, hard-to-debug behavior. Each phase must be explicitly shown.
-
 {% if fact_preconditions %}
-## Fact Preconditions (from planner's referenced investigation facts)
+## Fact Dependency Chain (from planner's referenced investigation facts)
 
-The oracle planner referenced specific investigation facts when crafting this proposal. Each referenced fact has preconditions — things that should already be established in the interaction history before the fact's knowledge is appropriate to apply. Use these preconditions as **additional validation criteria**:
+The oracle planner based this proposal on specific investigation facts. Each fact below
+was used to inform the proposal's reasoning or action.
 
-- If a precondition states "Must already have read file X" or "Must already have identified Y", check whether the interaction history actually shows that the debugger has performed that action or reached that understanding.
-- If preconditions are NOT met, the proposal is introducing knowledge that the debugger hasn't earned yet through its investigation — this is a form of unjustified knowledge jump.
-- Satisfied preconditions provide evidence that the proposal is well-grounded and the knowledge within it is reachable from the current history.
+**How to read this section:**
+- Each **Fact [ID]** describes a piece of knowledge the proposal relies on.
+- Each fact may have **prerequisites** — other facts (shown as `[ID] (category): statement`)
+  that should have been established first in the interaction history.
+- A prerequisite is **satisfied** if the debugger has already performed an equivalent
+  investigation step and the finding is visible in the history.
+- A prerequisite is **NOT satisfied** if the knowledge it describes has not been observed
+  yet — meaning the proposal is making an unjustified knowledge jump.
+
+**Validation rule:** For each fact referenced by the proposal, check that ALL its
+prerequisites are satisfied by the interaction history. If any prerequisite's knowledge
+is missing from the history, the proposal introduces knowledge the debugger hasn't earned.
 
 {% for fp in fact_preconditions %}
-### Fact: {{ fp.fact_id }} (Stage: {{ fp.stage }})
-Summary: {{ fp.fact_summary }}
-Preconditions that should be satisfied:
+### Fact [{{ fp.fact_id }}] ({{ fp.category | default('unknown') }})
+**Knowledge used:** {{ fp.fact_summary }}
+{% if fp.preconditions %}
+**Prerequisites that must be visible in history:**
 {% for pc in fp.preconditions %}
   - {{ pc }}
 {% endfor %}
+{% else %}
+(root fact — no prerequisites)
+{% endif %}
 
 {% endfor %}
 {% endif %}
@@ -64,14 +60,9 @@ Invalid red flags (automatic rejection):
 - Mentions of reference/oracle artifacts (e.g., "golden patch", "reference patch", "oracle says").
 - Exact fix details (specific replacement values, exact line details) not established by history.
 - Naming implementation-specific file/module/symbol details absent from history and issue text.
-- Ignores or contradicts required workflow phases from History Event 1.
-- Proposes implementation fixes before showing/repairing reproduction evidence when reproduction is required.
-- Fails to meet History Event 0 and History Event 1 requirements.
-- **Phase 6 edit action (str_replace / code edit) proposed when Phase 5 analysis is missing from history** — the proposal should instead suggest a `think` call for fix analysis.
-- **Phase skip:** proposes an action belonging to Phase N+2 or later when Phase N has not been completed.
-- Proposals where the REASONING text does not explain the "why" — just stating "let me fix this" without justification is insufficient for SFT data quality.
+- Proposals that lack reasoning — just stating "let me fix this" without explaining why is insufficient.
 {% if fact_preconditions %}
-- **Unsatisfied fact preconditions:** If the proposal relies on knowledge from referenced facts whose preconditions are NOT met by the interaction history, this indicates an unjustified knowledge jump. The proposal should first perform the actions required by the unsatisfied preconditions.
+- **Unsatisfied fact preconditions:** If the proposal relies on knowledge from referenced facts whose preconditions are NOT met by the interaction history, this indicates an unjustified knowledge jump.
 {% endif %}
 
 Return exactly one JSON object and nothing else:

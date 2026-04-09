@@ -226,27 +226,39 @@ def build_runtime_image_in_folder(
         f'Image [{hash_image_name}] for base [{base_image}] not found locally, checking remote registry...'
     )
     try:
-        if runtime_builder.image_exists(hash_image_name, pull_from_repo=True):
+        # if runtime_builder.image_exists(hash_image_name, pull_from_repo=True):
+        #     logger.info(
+        #         f'✅ Successfully pulled prebuilt image from registry: [{hash_image_name}]'
+        #     )
+        #     return hash_image_name
+        # elif runtime_builder.image_exists(lock_image_name, pull_from_repo=True):
+        #     logger.info(
+        #         f'✅ Successfully pulled prebuilt lock image from registry: [{lock_image_name}]'
+        #     )
+        #     return lock_image_name
+        # else:
+        #     simple_tag = base_image.replace('/', '_').replace(':', '_')
+        #     simple_image_name = f'{runtime_image_repo}:{simple_tag}'
+        #     if runtime_builder.image_exists(simple_image_name, pull_from_repo=True):
+        #         logger.info(
+        #             f'✅ Successfully pulled prebuilt base image from registry: [{simple_image_name}]'
+        #         )
+        #         return simple_image_name
+        #     logger.info(
+        #         f'Hash image [hash_image_name:{hash_image_name}], lock image [lock_image_name:{lock_image_name}], or simple image [simple_image_name:{simple_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
+        #     )
+            
+        simple_tag = base_image.replace('/', '_').replace(':', '_')
+        simple_image_name = f'{runtime_image_repo}:{simple_tag}'
+        if runtime_builder.image_exists(simple_image_name, pull_from_repo=True):
             logger.info(
-                f'✅ Successfully pulled prebuilt image from registry: [{hash_image_name}]'
+                f'✅ Successfully pulled prebuilt base image from registry: [{simple_image_name}]'
             )
-            return hash_image_name
-        elif runtime_builder.image_exists(lock_image_name, pull_from_repo=True):
-            logger.info(
-                f'✅ Successfully pulled prebuilt lock image from registry: [{lock_image_name}]'
-            )
-            return lock_image_name
-        else:
-            simple_tag = base_image.replace('/', '_').replace(':', '_')
-            simple_image_name = f'{runtime_image_repo}:{simple_tag}'
-            if runtime_builder.image_exists(simple_image_name, pull_from_repo=True):
-                logger.info(
-                    f'✅ Successfully pulled prebuilt base image from registry: [{simple_image_name}]'
-                )
-                return simple_image_name
-            logger.info(
-                f'Hash image [hash_image_name:{hash_image_name}], lock image [lock_image_name:{lock_image_name}], or simple image [simple_image_name:{simple_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
-            )
+            return simple_image_name
+        logger.info(
+            f'Hash image [hash_image_name:{hash_image_name}], lock image [lock_image_name:{lock_image_name}], or simple image [simple_image_name:{simple_image_name}] for base [{base_image}] not found in remote registry, will build locally.'
+        )
+        
     except Exception as e:
         error_str = str(e).lower()
         # Check if this is a "not found" error (image doesn't exist in registry)

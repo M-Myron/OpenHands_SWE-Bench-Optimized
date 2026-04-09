@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import TYPE_CHECKING
 
 from openhands.agenthub.codeact_agent.codeact_agent import CodeActAgent
@@ -14,6 +15,7 @@ from openhands.agenthub.oracle_triad_codeact_agent.oracle_planner import (
     PlannerDecision,
     ReactFactTracker,
 )
+from openhands.agenthub.oracle_triad_codeact_agent.triad_config import TriadConfig
 from openhands.agenthub.oracle_triad_codeact_agent.proposal_critic import (
     OracleProposalCritic,
     ProposalValidationResult,
@@ -125,6 +127,10 @@ class OracleTriadCodeActAgent(CodeActAgent):
         self._verifier: HistoryGroundedVerifier | None = None
         self._components_initialized = False
 
+        # Load config (YAML file or defaults) and export to env vars
+        self._triad_config = TriadConfig.load()
+        self._triad_config.export_to_env()
+
         # Read validator selection ------------------------------------------
         # PROPOSAL_VALIDATOR: 'verifier' | 'critic' | 'none'  (default: verifier)
         # Legacy compat: USE_LEGACY_CRITIC=1 is equivalent to PROPOSAL_VALIDATOR=critic
@@ -146,6 +152,9 @@ class OracleTriadCodeActAgent(CodeActAgent):
             int(os.environ.get('ORACLE_PLANNER_MAX_RETRIES', '2')),
             0,
         )
+        # -1 = full history (no windowing), positive int = last N action steps
+        _hw = int(os.environ.get('ORACLE_PLANNER_HISTORY_WINDOW', '5'))
+        self._planner_history_window: int = _hw if _hw >= 1 else -1
 
     def step(self, state: 'State') -> 'Action':
         if self.pending_actions:
@@ -181,10 +190,23 @@ class OracleTriadCodeActAgent(CodeActAgent):
 
         step_index = state.iteration_flag.current_value
         full_history_text = self._render_history_text_full(state.history)
+        # Windowed history for the planner (keeps summary + last N steps; -1 = full)
+        if self._planner_history_window < 0:
+            planner_history_text = full_history_text
+        else:
+            planner_history_text = self._render_history_text_windowed(
+                state.history, window=self._planner_history_window,
+            )
+
+        # ---- Timing instrumentation ----
+        step_t0 = time.monotonic()
+        timing: dict[str, float] = {}
+        llm_calls: dict[str, int] = {}
 
         candidate_responses = []
         candidate_texts: list[str] = []
 
+        t0 = time.monotonic()
         for candidate_index in range(self._num_candidates):
             response = self.llm.completion(**params)
             text = self._extract_response_text(response)
@@ -199,19 +221,29 @@ class OracleTriadCodeActAgent(CodeActAgent):
             }
             self.triad_log.append(entry)
             _append_triage_entry(entry)
+        timing['candidates'] = time.monotonic() - t0
+        llm_calls['candidates'] = self._num_candidates
 
         chosen_response = None
         planner_feedback = ''
         planner_best_idx = 0
+        planner_llm_calls = 0
+        verifier_llm_calls = 0
+        planner_time = 0.0
+        verifier_time = 0.0
+        materialization_time = 0.0
 
         for planner_attempt in range(self._planner_max_retries + 1):
+            t0 = time.monotonic()
             decision = self._plan_next_response(
                 step_index=step_index,
-                history_text=full_history_text,
+                history_text=planner_history_text,
                 candidates=candidate_texts,
                 feedback=planner_feedback,
                 attempt=planner_attempt,
             )
+            planner_time += time.monotonic() - t0
+            planner_llm_calls += 1  # at least 1 per attempt (may have JSON retries)
             planner_best_idx = decision.best_candidate_index
 
             planner_entry = {
@@ -238,18 +270,22 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 chosen_response = candidate_responses[idx]
                 # Mark referenced facts as used on accepted decision
                 if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
-                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
+                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids, step_index=step_index)
+                self._oracle_planner.record_accepted_decision(decision)
                 break
 
             if self._proposal_critic is None and self._verifier is None:
+                t_m = time.monotonic()
                 chosen_response = self._materialize_planner_proposal(
                     base_messages=params['messages'],
                     planner_proposal=decision.proposal_response_text,
                     state=state,
                 )
+                materialization_time += time.monotonic() - t_m
                 # Mark referenced facts as used on accepted proposal (no critic/verifier)
                 if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
-                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
+                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids, step_index=step_index)
+                self._oracle_planner.record_accepted_decision(decision)
                 break
 
             # --- Validate proposal via verifier or legacy critic -----------
@@ -258,6 +294,7 @@ class OracleTriadCodeActAgent(CodeActAgent):
             validation_reason = ''
 
             if self._verifier is not None:
+                t_v = time.monotonic()
                 history_memory = StructuredHistoryMemory.from_events(state.history)
                 verdict = self._verifier.verify(
                     step_index=step_index,
@@ -266,6 +303,14 @@ class OracleTriadCodeActAgent(CodeActAgent):
                     fact_preconditions=fact_preconditions if fact_preconditions else None,
                     attempt=planner_attempt,
                 )
+                verifier_time += time.monotonic() - t_v
+                # Count verifier LLM calls from the timing log
+                vtiming = getattr(verdict, '_timing', None)
+                if vtiming and isinstance(vtiming, dict):
+                    verifier_llm_calls += vtiming.get('llm_calls', 0)
+                else:
+                    # Estimate: extraction(1) + resolution(0-1) + synthesis(0-1)
+                    verifier_llm_calls += 1  # at least extraction
 
                 verifier_entry = {
                     'step_index': step_index,
@@ -303,18 +348,28 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 validation_reason = validation.reason
 
             if validation_valid:
+                t_m = time.monotonic()
                 chosen_response = self._materialize_planner_proposal(
                     base_messages=params['messages'],
                     planner_proposal=decision.proposal_response_text,
                     state=state,
                 )
+                materialization_time += time.monotonic() - t_m
                 # Mark referenced facts as used on accepted proposal
                 if referenced_ids and self._oracle_planner and self._oracle_planner.react_fact_tracker:
-                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids)
+                    self._oracle_planner.react_fact_tracker.mark_facts_used(referenced_ids, step_index=step_index)
+                self._oracle_planner.record_accepted_decision(decision)
                 break
 
             if planner_attempt < self._planner_max_retries:
-                planner_feedback = validation_feedback or validation_reason
+                # Include the rejected proposal text so the planner knows what was rejected
+                rejected_proposal = decision.proposal_response_text
+                planner_feedback = (
+                    f'## Your Previous Proposal (rejected)\n'
+                    f'{rejected_proposal}\n\n'
+                    f'## Rejection Reason\n'
+                    f'{validation_feedback or validation_reason}'
+                )
                 continue
 
             logger.warning(
@@ -347,6 +402,34 @@ class OracleTriadCodeActAgent(CodeActAgent):
         actions = self.response_to_actions(chosen_response)
         for action in actions:
             self.pending_actions.append(action)
+
+        # ---- Timing summary ----
+        timing['planner'] = planner_time
+        timing['verifier'] = verifier_time
+        timing['materialization'] = materialization_time
+        timing['step_total'] = time.monotonic() - step_t0
+        llm_calls['planner'] = planner_llm_calls
+        llm_calls['verifier'] = verifier_llm_calls
+        llm_calls['materialization'] = 1 if materialization_time > 0 else 0
+        llm_calls['total'] = sum(llm_calls.values())
+
+        timing_entry = {
+            'step_index': step_index,
+            'event': 'step_timing',
+            'timing_seconds': {k: round(v, 2) for k, v in timing.items()},
+            'llm_calls': llm_calls,
+        }
+        self.triad_log.append(timing_entry)
+        _append_triage_entry(timing_entry)
+
+        logger.info(
+            f'[OracleTriadCodeActAgent] Step {step_index} timing: '
+            f'candidates={timing["candidates"]:.1f}s ({llm_calls["candidates"]} calls), '
+            f'planner={timing["planner"]:.1f}s ({llm_calls["planner"]} calls), '
+            f'verifier={timing["verifier"]:.1f}s ({llm_calls["verifier"]} calls), '
+            f'materialization={timing["materialization"]:.1f}s, '
+            f'total={timing["step_total"]:.1f}s ({llm_calls["total"]} LLM calls)'
+        )
         return self.pending_actions.popleft()
 
     def _init_components(self, state: 'State') -> None:
@@ -368,6 +451,7 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 oracle_context=oracle_context,
                 tool_descriptions=tool_descriptions,
                 react_fact_tracker=react_fact_tracker,
+                prompt_config=self._triad_config.planner_prompt,
             )
 
             # ---- initialise selected proposal validator ------------------
@@ -435,7 +519,7 @@ class OracleTriadCodeActAgent(CodeActAgent):
             attempt=attempt,
         )
 
-        if decision.best_candidate_index < 0 or decision.best_candidate_index >= len(candidates):
+        if decision.best_candidate_index is None or decision.best_candidate_index < 0 or decision.best_candidate_index >= len(candidates):
             decision.best_candidate_index = 0
 
         if decision.decision == 'candidate':
@@ -530,7 +614,10 @@ class OracleTriadCodeActAgent(CodeActAgent):
         return list(messages) + [message]
 
     def _load_oracle_context(self) -> tuple[str, dict | None]:
-        """Load oracle context and return (context_text, react_facts_data)."""
+        """Load oracle context and return (context_text, react_facts_data).
+
+        Which sections are included is controlled by ``self._triad_config.oracle_context``.
+        """
         context_path = os.environ.get('ORACLE_PLANNER_CONTEXT_PATH', '').strip()
         if not context_path:
             return 'No oracle context file was provided.', None
@@ -544,24 +631,35 @@ class OracleTriadCodeActAgent(CodeActAgent):
             )
             return f'Failed to load oracle context ({exc}).', None
 
+        ctx_cfg = self._triad_config.oracle_context
+
         patch = str(payload.get('patch', '') or '')
         test_patch = str(payload.get('test_patch', '') or '')
         issue_understanding = str(payload.get('issue_understanding', '') or '')
         deep_analysis = str(payload.get('deep_analysis', '') or '')
-        react_facts = payload.get('react_facts', None)
+        react_facts = payload.get('react_facts', None) if ctx_cfg.include_react_facts else None
 
-        parts = [
-            '## Golden Patch',
-            patch,
-            '',
-            '## Golden Test Patch',
-            test_patch,
-            '',
-            '## Issue Understanding Package',
-            issue_understanding if issue_understanding else '(not provided)',
-        ]
+        parts: list[str] = []
 
-        if deep_analysis:
+        if ctx_cfg.include_golden_patch:
+            parts.extend(['## Golden Patch', patch, ''])
+        else:
+            parts.extend(['## Golden Patch', '(disabled by config)', ''])
+
+        if ctx_cfg.include_golden_test_patch:
+            parts.extend(['## Golden Test Patch', test_patch, ''])
+        else:
+            parts.extend(['## Golden Test Patch', '(disabled by config)', ''])
+
+        if ctx_cfg.include_issue_understanding:
+            parts.extend([
+                '## Issue Understanding Package',
+                issue_understanding if issue_understanding else '(not provided)',
+            ])
+        else:
+            parts.extend(['## Issue Understanding Package', '(disabled by config)'])
+
+        if ctx_cfg.include_deep_analysis and deep_analysis:
             parts.extend([
                 '',
                 '## Deep Root-Cause Analysis',
@@ -752,6 +850,126 @@ class OracleTriadCodeActAgent(CodeActAgent):
                 lines.append(f'[Event {i}] ACTION ({action_name}): {action_message}')
             else:
                 lines.append(f'[Event {i}] EVENT ({type(event).__name__}): {str(event)}')
+
+        body = '\n'.join(lines) if lines else '(no prior interactions)'
+        return '\n'.join(index_lines) + body
+
+    @staticmethod
+    def _render_history_text_windowed(events: list[Event], window: int = 5) -> str:
+        """Render history text with only the last `window` action-observation pairs.
+
+        Keeps the full SESSION SUMMARY (file/command inventories) but truncates
+        the event body to only recent steps, saving tokens in the planner prompt.
+        """
+        from openhands.events.action.action import Action
+        from openhands.events.action.agent import AgentThinkAction
+        from openhands.events.action.message import SystemMessageAction
+        from openhands.events.action import CmdRunAction, FileEditAction, FileReadAction
+        from openhands.events.observation import (
+            CmdOutputObservation,
+            FileEditObservation,
+            FileReadObservation,
+        )
+
+        # --- Build the same SESSION SUMMARY as the full version ---
+        files_read: list[str] = []
+        files_edited: list[str] = []
+        commands_run: list[str] = []
+
+        for event in events:
+            if isinstance(event, FileReadAction):
+                if event.path not in files_read:
+                    files_read.append(event.path)
+            elif isinstance(event, FileEditAction):
+                if event.path not in files_edited:
+                    files_edited.append(event.path)
+            elif isinstance(event, CmdRunAction):
+                commands_run.append(event.command)
+
+        index_lines: list[str] = ['=== SESSION SUMMARY ===']
+        index_lines.append(f'  - Event 0: OpenHands system instruction (debugger capabilities)')
+        index_lines.append(f'  - Event 1: SWE-bench task + 8-phase workflow (issue description provided separately)')
+        if files_read:
+            index_lines.append('Files read:')
+            for path in files_read:
+                index_lines.append(f'  - {path}')
+        if files_edited:
+            index_lines.append('Files edited:')
+            for path in files_edited:
+                index_lines.append(f'  - {path}')
+        if commands_run:
+            index_lines.append('Commands run:')
+            for command in commands_run:
+                index_lines.append(f'  - {command}')
+        index_lines.append('=== END SESSION SUMMARY ===')
+        index_lines.append('')
+
+        # --- Count action events (non-system, non-user) to find the window ---
+        # An "action step" is a non-system, non-user Action event.
+        action_indices: list[int] = []
+        for i, event in enumerate(events):
+            if isinstance(event, SystemMessageAction):
+                continue
+            if isinstance(event, MessageAction) and event.source == 'user':
+                continue
+            if isinstance(event, Action):
+                action_indices.append(i)
+
+        # Determine the starting event index for the window
+        if len(action_indices) <= window:
+            # Show all events
+            window_start_event = 0
+        else:
+            # Show only events from the `window`-th-last action onwards
+            window_start_event = action_indices[-window]
+
+        # --- Render only events within the window ---
+        total_events = len(events)
+        skipped = sum(1 for i, e in enumerate(events)
+                      if i < window_start_event
+                      and not isinstance(e, SystemMessageAction)
+                      and not (isinstance(e, MessageAction) and e.source == 'user'))
+
+        lines: list[str] = []
+        if skipped > 0:
+            lines.append(f'... ({skipped} earlier events omitted, see SESSION SUMMARY above) ...')
+            lines.append('')
+
+        for i, event in enumerate(events):
+            if i < window_start_event:
+                continue
+            if isinstance(event, SystemMessageAction):
+                continue
+            if isinstance(event, MessageAction) and event.source == 'user':
+                continue
+            if isinstance(event, MessageAction) and event.source == 'agent':
+                lines.append(f'[Event {i}] AGENT MESSAGE: {event.content}')
+            elif isinstance(event, AgentThinkAction):
+                lines.append(f'[Event {i}] AGENT THOUGHT: {event.thought}')
+            elif isinstance(event, CmdRunAction):
+                if event.thought:
+                    lines.append(f'[Event {i}] AGENT THOUGHT: {event.thought}')
+                lines.append(f'[Event {i}] RUN COMMAND: {event.command}')
+            elif isinstance(event, FileReadAction):
+                if event.thought:
+                    lines.append(f'[Event {i}] AGENT THOUGHT: {event.thought}')
+                lines.append(f'[Event {i}] READ FILE: {event.path}')
+            elif isinstance(event, FileEditAction):
+                if event.thought:
+                    lines.append(f'[Event {i}] AGENT THOUGHT: {event.thought}')
+                lines.append(f'[Event {i}] EDIT FILE: {event.path} -- {event.content}')
+            elif isinstance(event, CmdOutputObservation):
+                lines.append(f'[Event {i}] OBS (exit={event.exit_code}): {event.content}')
+            elif isinstance(event, FileReadObservation):
+                lines.append(f'[Event {i}] OBS (file read): {event.content}')
+            elif isinstance(event, FileEditObservation):
+                lines.append(f'[Event {i}] OBS (file edit): {event.content}')
+            elif isinstance(event, Observation):
+                lines.append(f'[Event {i}] OBS: {str(event.content)}')
+            elif isinstance(event, Action):
+                action_name = type(event).__name__
+                action_message = getattr(event, 'message', '') or ''
+                lines.append(f'[Event {i}] ACTION ({action_name}): {action_message}')
 
         body = '\n'.join(lines) if lines else '(no prior interactions)'
         return '\n'.join(index_lines) + body

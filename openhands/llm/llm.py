@@ -27,7 +27,11 @@ from litellm.exceptions import (
 from litellm.types.utils import CostPerToken, ModelResponse, Usage
 from litellm.utils import create_pretrained_tokenizer
 
-from openhands.core.exceptions import LLMNoResponseError
+from openhands.core.exceptions import (
+    FunctionCallConversionError,
+    FunctionCallValidationError,
+    LLMNoResponseError,
+)
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.message import Message
 from openhands.llm.debug_mixin import DebugMixin
@@ -354,11 +358,31 @@ class LLM(RetryMixin, DebugMixin):
 
                 non_fncall_response_message = resp.choices[0].message
                 # messages is already a list with proper typing from line 223
-                fn_call_messages_with_response = (
-                    convert_non_fncall_messages_to_fncall_messages(
-                        messages + [non_fncall_response_message], mock_fncall_tools
+                try:
+                    fn_call_messages_with_response = (
+                        convert_non_fncall_messages_to_fncall_messages(
+                            messages + [non_fncall_response_message], mock_fncall_tools
+                        )
                     )
-                )
+                except (
+                    FunctionCallValidationError,
+                    FunctionCallConversionError,
+                ) as e:
+                    # Include the model's raw output in the error so the agent
+                    # (and ultimately the model) can see what it generated wrong.
+                    raw_content = getattr(
+                        non_fncall_response_message, 'content', ''
+                    ) or ''
+                    if isinstance(raw_content, list):
+                        raw_content = '\n'.join(
+                            p.get('text', '') for p in raw_content if isinstance(p, dict) and p.get('type') == 'text'
+                        )
+                    # Truncate to avoid huge error messages
+                    if len(raw_content) > 500:
+                        raw_content = raw_content[:500] + '...'
+                    raise type(e)(
+                        f'{e}\n\nYour raw output that caused this error:\n{raw_content}'
+                    ) from e
                 fn_call_response_message = fn_call_messages_with_response[-1]
                 if not isinstance(fn_call_response_message, LiteLLMMessage):
                     fn_call_response_message = LiteLLMMessage(

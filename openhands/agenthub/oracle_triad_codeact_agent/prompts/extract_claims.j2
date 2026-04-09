@@ -7,14 +7,24 @@ You do NOT judge validity — you only decompose and classify.
 ## Proposal to Analyze (Step {{ step_index }})
 {{ proposal_text }}
 
-## Oracle-Supplied Preconditions
+## Oracle-Supplied Fact Context
 {% if oracle_preconditions %}
+The oracle planner referenced specific investigation facts when crafting this proposal.
+Each fact below was used to inform the proposal. Each fact may have **preconditions** —
+other facts that should have been established first. When extracting claims, check whether
+the precondition facts' knowledge is visible in the interaction history.
+
 {% for fp in oracle_preconditions %}
-- Fact {{ fp.fact_id }} (stage: {{ fp.stage }}): {{ fp.fact_summary }}
-  Preconditions:
+- **Fact [{{ fp.fact_id }}]** ({{ fp.category | default('unknown') }}): {{ fp.fact_summary }}
+{% if fp.preconditions %}
+  This fact depends on:
 {% for pc in fp.preconditions %}
     - {{ pc }}
 {% endfor %}
+  → Check: is the knowledge from these prerequisite facts visible in the history? If not, the proposal may be making unjustified knowledge jumps.
+{% else %}
+  (no preconditions — this is a root fact)
+{% endif %}
 {% endfor %}
 {% else %}
 (none provided)
