@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+"""Thin action executor for running inside raw SWE-bench Docker containers.
+
+This is a self-contained, pure-stdlib Python HTTP server that provides the same
+/execute_action, /alive, /list_files, /upload_file, /download_files endpoints
+as the full OpenHands action_execution_server, but without ANY pip dependencies.
+
+It manages a persistent bash subprocess for command execution and provides
+file read/write/edit operations needed by CodeActAgent and OracleGuidedCodeActAgent.
+
+Usage:
+    python thin_executor.py <port> [--working-dir /workspace]
+"""
+
+import argparse
+import base64
+import io
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SENTINEL_PREFIX = '___THIN_SENTINEL_'
+SENTINEL_SUFFIX = '___'
+PS1_SENTINEL = '__THIN_PS1__'  # Used to detect prompt
+
+DEFAULT_TIMEOUT = 600  # 10 minutes
+NO_CHANGE_TIMEOUT = 30  # seconds with no output change
+
+BINARY_EXTENSIONS = frozenset({
+    '.pyc', '.pyo', '.so', '.o', '.a', '.lib', '.dll', '.dylib',
+    '.exe', '.bin', '.dat', '.db', '.sqlite', '.sqlite3',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.tiff', '.webp',
+    '.mp3', '.mp4', '.avi', '.mov', '.wav', '.flac', '.ogg', '.webm',
+    '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.woff', '.woff2', '.ttf', '.eot',
+    '.class', '.jar',
+})
+
+IMAGE_EXTENSIONS = frozenset({'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'})
+
+
+# ---------------------------------------------------------------------------
+# Persistent Bash Session
+# ---------------------------------------------------------------------------
+class BashSession:
+    """Manages a persistent interactive bash subprocess."""
+
+    def __init__(self, working_dir: str = '/workspace'):
+        self.working_dir = working_dir
+        self.cwd = working_dir
+        self._process = None
+        self._output_lock = threading.Lock()
+        self._accumulated_output = ''
+        self._reader_thread = None
+        self._started = False
+
+    def start(self):
+        """Start the persistent bash process."""
+        env = os.environ.copy()
+        env['TERM'] = 'dumb'
+        env['PS1'] = ''  # Suppress prompt for cleaner output parsing
+        env['PAGER'] = 'cat'
+        env['GIT_PAGER'] = 'cat'
+
+        self._process = subprocess.Popen(
+            ['bash', '--norc', '--noprofile', '-i'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=self.working_dir,
+            env=env,
+            bufsize=0,
+            preexec_fn=os.setsid,  # Create new process group for signal handling
+        )
+
+        # Start reader thread
+        self._reader_thread = threading.Thread(
+            target=self._read_output_loop, daemon=True
+        )
+        self._reader_thread.start()
+
+        # Wait for shell to be ready, then configure it
+        time.sleep(0.3)
+        self._clear_output()
+
+        # Source conda/bashrc for testbed environment (SWE-bench specific)
+        init_commands = [
+            'set +o history',  # Disable history to reduce noise
+            'export PS1=""',
+            'export PAGER=cat',
+            'export GIT_PAGER=cat',
+        ]
+        for cmd in init_commands:
+            self._run_raw(cmd, timeout=10)
+
+        self._started = True
+
+    def _read_output_loop(self):
+        """Continuously read stdout from the bash process."""
+        while True:
+            try:
+                data = self._process.stdout.read(4096)
+                if not data:
+                    break
+                with self._output_lock:
+                    self._accumulated_output += data.decode('utf-8', errors='replace')
+            except Exception:
+                break
+
+    def _clear_output(self):
+        """Clear accumulated output."""
+        time.sleep(0.1)  # Let pending output arrive
+        with self._output_lock:
+            self._accumulated_output = ''
+
+    def _get_output(self):
+        """Get current accumulated output."""
+        with self._output_lock:
+            return self._accumulated_output
+
+    def _run_raw(self, command: str, timeout: float = 30):
+        """Run a command without sentinel detection (for initialization)."""
+        self._clear_output()
+        self._process.stdin.write((command + '\n').encode())
+        self._process.stdin.flush()
+        time.sleep(0.5)
+        return self._get_output()
+
+    def execute(
+        self,
+        command: str,
+        timeout: float = DEFAULT_TIMEOUT,
+        is_input: bool = False,
+        blocking: bool = True,
+    ):
+        """Execute a command and return (exit_code, output, cwd).
+
+        Uses a unique sentinel marker to detect command completion.
+        """
+        if self._process is None or self._process.poll() is not None:
+            return (-1, 'ERROR: Bash session is no longer running.', self.cwd)
+
+        sentinel = f'{SENTINEL_PREFIX}{uuid.uuid4().hex[:12]}{SENTINEL_SUFFIX}'
+
+        # Clear any pending output
+        self._clear_output()
+
+        if is_input:
+            # For input to running command, just send without sentinel
+            if command.startswith('C-') and len(command) <= 3:
+                # Special keys: C-c, C-z, C-d
+                sig_map = {'C-c': signal.SIGINT, 'C-z': signal.SIGTSTP, 'C-d': None}
+                if command == 'C-d':
+                    self._process.stdin.write(b'\x04')
+                    self._process.stdin.flush()
+                elif command in sig_map and sig_map[command] is not None:
+                    try:
+                        os.killpg(os.getpgid(self._process.pid), sig_map[command])
+                    except ProcessLookupError:
+                        pass
+                time.sleep(0.5)
+                output = self._get_output()
+                return (-1, output, self.cwd)
+            else:
+                self._process.stdin.write((command + '\n').encode())
+                self._process.stdin.flush()
+                time.sleep(0.5)
+                output = self._get_output()
+                return (-1, output, self.cwd)
+
+        # Construct the full command with sentinel for completion detection
+        # The sentinel echoes exit code and cwd after command completes
+        full_command = (
+            f'{command}\n'
+            f'_exit_code=$?; echo "{sentinel}|EXIT_CODE=${{_exit_code}}|CWD=$(pwd)"; '
+            f'echo "{sentinel}_END"\n'
+        )
+
+        self._process.stdin.write(full_command.encode())
+        self._process.stdin.flush()
+
+        # Wait for sentinel to appear in output
+        start_time = time.time()
+        last_change_time = start_time
+        last_output = ''
+
+        while True:
+            elapsed = time.time() - start_time
+            current_output = self._get_output()
+
+            # Check for sentinel completion
+            sentinel_end = f'{sentinel}_END'
+            if sentinel_end in current_output:
+                # Parse the output
+                output_parts = current_output.split(sentinel)
+                # The command output is everything before the first sentinel
+                cmd_output = output_parts[0] if output_parts else ''
+
+                # Parse exit code and cwd from sentinel line
+                exit_code = 0
+                new_cwd = self.cwd
+                for part in output_parts[1:]:
+                    if '|EXIT_CODE=' in part:
+                        try:
+                            ec_str = part.split('|EXIT_CODE=')[1].split('|')[0]
+                            exit_code = int(ec_str.strip())
+                        except (ValueError, IndexError):
+                            pass
+                    if '|CWD=' in part:
+                        try:
+                            cwd_str = part.split('|CWD=')[1].split('|')[0].split('\n')[0]
+                            new_cwd = cwd_str.strip()
+                        except (ValueError, IndexError):
+                            pass
+
+                self.cwd = new_cwd
+
+                # Clean up the command output
+                # Remove the sentinel commands that got echoed
+                cmd_output = cmd_output.strip()
+
+                return (exit_code, cmd_output, self.cwd)
+
+            # Check timeouts
+            if elapsed >= timeout:
+                output = current_output.strip()
+                return (-1, output + '\n[Command timed out]', self.cwd)
+
+            # No-change timeout (for non-blocking commands)
+            if not blocking:
+                if current_output != last_output:
+                    last_change_time = time.time()
+                    last_output = current_output
+                elif time.time() - last_change_time > NO_CHANGE_TIMEOUT:
+                    output = current_output.strip()
+                    return (-1, output + '\n[No output change timeout]', self.cwd)
+
+            time.sleep(0.2)
+
+    def close(self):
+        """Terminate the bash session."""
+        if self._process and self._process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            self._process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# File Operations
+# ---------------------------------------------------------------------------
+def _is_binary(filepath: str) -> bool:
+    """Check if a file is binary."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in BINARY_EXTENSIONS:
+        return True
+    try:
+        with open(filepath, 'rb') as f:
+            chunk = f.read(8192)
+            if b'\x00' in chunk:
+                return True
+    except (OSError, IOError):
+        return False
+    return False
+
+
+def _resolve_path(path: str, cwd: str) -> str:
+    """Resolve a relative path against the current working directory."""
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(cwd, path))
+
+
+def handle_file_read(path: str, cwd: str, start: int = 0, end: int = -1):
+    """Read a file and return its content."""
+    filepath = _resolve_path(path, cwd)
+
+    if not os.path.exists(filepath):
+        return {
+            'observation': 'error',
+            'content': f'File not found: {filepath}. Your current working directory is {cwd}.',
+            'extras': {},
+        }
+
+    if os.path.isdir(filepath):
+        return {
+            'observation': 'error',
+            'content': f'Path is a directory: {filepath}. You can only read files',
+            'extras': {},
+        }
+
+    # Handle image files
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in IMAGE_EXTENSIONS:
+        try:
+            with open(filepath, 'rb') as f:
+                image_data = f.read()
+                encoded = base64.b64encode(image_data).decode('utf-8')
+                mime_map = {
+                    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                    '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp',
+                }
+                mime = mime_map.get(ext, 'image/png')
+                content = f'data:{mime};base64,{encoded}'
+                return {
+                    'observation': 'read',
+                    'content': content,
+                    'extras': {'path': filepath},
+                }
+        except Exception as e:
+            return {'observation': 'error', 'content': str(e), 'extras': {}}
+
+    # Handle PDF
+    if ext == '.pdf':
+        try:
+            with open(filepath, 'rb') as f:
+                pdf_data = f.read()
+                encoded = base64.b64encode(pdf_data).decode('utf-8')
+                content = f'data:application/pdf;base64,{encoded}'
+                return {
+                    'observation': 'read',
+                    'content': content,
+                    'extras': {'path': filepath},
+                }
+        except Exception as e:
+            return {'observation': 'error', 'content': str(e), 'extras': {}}
+
+    if _is_binary(filepath):
+        return {
+            'observation': 'error',
+            'content': 'ERROR_BINARY_FILE',
+            'extras': {},
+        }
+
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        return {
+            'observation': 'error',
+            'content': f'File could not be decoded as utf-8: {filepath}.',
+            'extras': {},
+        }
+    except Exception as e:
+        return {'observation': 'error', 'content': str(e), 'extras': {}}
+
+    # Apply line range
+    if start > 0 or end > 0:
+        start_idx = max(0, start - 1) if start > 0 else 0
+        end_idx = end if end > 0 else len(lines)
+        lines = lines[start_idx:end_idx]
+
+    content = ''.join(lines)
+    return {
+        'observation': 'read',
+        'content': content,
+        'extras': {'path': filepath},
+    }
+
+
+def handle_file_write(path: str, content: str, cwd: str, start: int = 0, end: int = -1):
+    """Write content to a file."""
+    filepath = _resolve_path(path, cwd)
+
+    if os.path.isdir(filepath):
+        return {
+            'observation': 'error',
+            'content': f'Path is a directory: {filepath}. You can only write to files',
+            'extras': {},
+        }
+
+    # Ensure parent directory exists
+    parent = os.path.dirname(filepath)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent)
+
+    insert = content.split('\n')
+
+    try:
+        file_exists = os.path.exists(filepath)
+        if file_exists and (start > 0 or end > 0):
+            with open(filepath, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+            # Simple insert/replace logic
+            start_idx = max(0, start - 1) if start > 0 else 0
+            end_idx = end if end > 0 else len(all_lines)
+            new_lines = all_lines[:start_idx] + [line + '\n' for line in insert] + all_lines[end_idx:]
+        else:
+            new_lines = [line + '\n' for line in insert]
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+
+    except Exception as e:
+        return {'observation': 'error', 'content': str(e), 'extras': {}}
+
+    return {
+        'observation': 'write',
+        'content': f'File written successfully to {filepath}.',
+        'extras': {'path': filepath},
+    }
+
+
+def handle_file_edit(path: str, cwd: str, command: str,
+                     old_str: str = None, new_str: str = None,
+                     file_text: str = None, view_range: list = None,
+                     insert_line: int = None):
+    """Handle file edit operations (view, str_replace, create, insert, undo_edit)."""
+    filepath = _resolve_path(path, cwd)
+
+    if command == 'view':
+        # Match regular runtime: edit view returns FileEditObservation, not FileReadObservation
+        result = handle_file_read(path, cwd,
+                                start=view_range[0] if view_range else 0,
+                                end=view_range[1] if view_range and len(view_range) > 1 else -1)
+        if result.get('observation') == 'read':
+            return {
+                'observation': 'edit',
+                'content': result['content'],
+                'extras': result.get('extras', {}),
+            }
+        return result  # error case, pass through
+
+    if command == 'create':
+        if file_text is None:
+            return {'observation': 'error', 'content': 'file_text is required for create', 'extras': {}}
+
+        # Match regular runtime behavior: create returns FileEditObservation, not FileWriteObservation
+        filepath_resolved = _resolve_path(path, cwd)
+        parent = os.path.dirname(filepath_resolved)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent)
+        try:
+            with open(filepath_resolved, 'w', encoding='utf-8') as f:
+                f.write(file_text)
+        except Exception as e:
+            return {'observation': 'error', 'content': str(e), 'extras': {}}
+
+        return {
+            'observation': 'edit',
+            'content': f'File created successfully at: {filepath_resolved}',
+            'extras': {
+                'path': filepath_resolved,
+                'old_content': '',
+                'new_content': file_text,
+                'impl_source': 'oh_aci',
+            },
+        }
+
+    if command == 'str_replace':
+        if old_str is None:
+            return {'observation': 'error', 'content': 'old_str is required for str_replace', 'extras': {}}
+
+        if not os.path.exists(filepath):
+            return {'observation': 'error', 'content': f'File not found: {filepath}', 'extras': {}}
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            return {'observation': 'error', 'content': f'File could not be decoded as utf-8: {filepath}', 'extras': {}}
+
+        count = content.count(old_str)
+        if count == 0:
+            return {
+                'observation': 'error',
+                'content': f'ERROR: No replacement was performed, old_str `{old_str}` did not appear verbatim in {filepath}.',
+                'extras': {},
+            }
+        if count > 1:
+            return {
+                'observation': 'error',
+                'content': f'ERROR: No replacement was performed. Multiple ({count}) occurrences of old_str `{old_str}` in lines of {filepath}. Please ensure it is unique.',
+                'extras': {},
+            }
+
+        new_content = content.replace(old_str, new_str if new_str is not None else '', 1)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+
+        # Compute a simple diff snippet
+        old_lines = old_str.split('\n')
+        new_lines = (new_str if new_str is not None else '').split('\n')
+        diff_parts = []
+        for line in old_lines:
+            diff_parts.append(f'-{line}')
+        for line in new_lines:
+            diff_parts.append(f'+{line}')
+        diff_str = '\n'.join(diff_parts)
+
+        return {
+            'observation': 'edit',
+            'content': f'The file {filepath} has been edited. Here\'s the result of running `cat -n` on a snippet of {filepath}:\n{diff_str}\n',
+            'extras': {
+                'path': filepath,
+                'old_content': content,
+                'new_content': new_content,
+                'diff': diff_str,
+                'impl_source': 'oh_aci',
+            },
+        }
+
+    if command == 'insert':
+        if insert_line is None:
+            return {'observation': 'error', 'content': 'insert_line is required for insert', 'extras': {}}
+        if new_str is None:
+            return {'observation': 'error', 'content': 'new_str is required for insert', 'extras': {}}
+
+        if not os.path.exists(filepath):
+            return {'observation': 'error', 'content': f'File not found: {filepath}', 'extras': {}}
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except UnicodeDecodeError:
+            return {'observation': 'error', 'content': f'File could not be decoded as utf-8: {filepath}', 'extras': {}}
+
+        insert_lines_list = new_str.split('\n')
+        insert_idx = max(0, min(insert_line, len(lines)))
+        for i, line in enumerate(insert_lines_list):
+            lines.insert(insert_idx + i, line + '\n')
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+        return {
+            'observation': 'edit',
+            'content': f'The file {filepath} has been edited.',
+            'extras': {'path': filepath},
+        }
+
+    return {'observation': 'error', 'content': f'Unknown edit command: {command}', 'extras': {}}
+
+
+# ---------------------------------------------------------------------------
+# Action Router
+# ---------------------------------------------------------------------------
+def route_action(action_dict: dict, bash_session: BashSession) -> dict:
+    """Route an action dict to the appropriate handler and return observation dict."""
+    action_type = action_dict.get('action', '')
+
+    if action_type == 'run':
+        # Bash command execution
+        command = action_dict.get('args', {}).get('command', '')
+        timeout = action_dict.get('timeout', DEFAULT_TIMEOUT)
+        is_input = action_dict.get('args', {}).get('is_input', False)
+        blocking = action_dict.get('args', {}).get('blocking', True)
+
+        if timeout is None:
+            timeout = DEFAULT_TIMEOUT
+
+        exit_code, output, cwd = bash_session.execute(
+            command, timeout=timeout, is_input=is_input, blocking=blocking
+        )
+
+        # Get python interpreter path
+        py_path = '/opt/miniconda3/envs/testbed/bin/python'
+        if not os.path.exists(py_path):
+            py_path = '/usr/bin/python3'
+
+        # Build metadata dict matching CmdOutputMetadata format
+        metadata = {
+            'exit_code': exit_code,
+            'pid': -1,
+            'username': os.environ.get('USER', 'root'),
+            'hostname': os.uname()[1] if hasattr(os, 'uname') else 'container',
+            'working_dir': cwd,
+            'py_interpreter_path': py_path,
+            'prefix': '',
+            'suffix': f'\n[The command completed with exit code {exit_code}.]'
+            if exit_code != -1
+            else '\n[The command is still running.]',
+        }
+
+        # Build suffix content matching the full runtime format
+        suffix_parts = []
+        if exit_code != -1:
+            suffix_parts.append(f'[The command completed with exit code {exit_code}.]')
+        else:
+            suffix_parts.append('[The command is still running.]')
+        suffix_parts.append(f'[Current working directory: {cwd}]')
+        suffix_parts.append(f'[Python interpreter: {py_path}]')
+        if exit_code != -1:
+            suffix_parts.append(f'[Command finished with exit code {exit_code}]')
+        else:
+            suffix_parts.append('[Command is still running in the background]')
+
+        full_suffix = '\n'.join(suffix_parts)
+
+        # Format output to match what ActionExecutionClient expects
+        content = output
+        if content and not content.endswith('\n'):
+            content += '\n'
+        content += full_suffix
+
+        return {
+            'observation': 'run',
+            'content': content,
+            'extras': {
+                'command': command,
+                'metadata': metadata,
+                'hidden': action_dict.get('args', {}).get('hidden', False),
+            },
+        }
+
+    elif action_type == 'read':
+        args = action_dict.get('args', {})
+        path = args.get('path', '')
+        start = args.get('start', 0)
+        end = args.get('end', -1)
+        return handle_file_read(path, bash_session.cwd, start, end)
+
+    elif action_type == 'write':
+        args = action_dict.get('args', {})
+        path = args.get('path', '')
+        content = args.get('content', '')
+        start = args.get('start', 0)
+        end = args.get('end', -1)
+        return handle_file_write(path, content, bash_session.cwd, start, end)
+
+    elif action_type == 'edit':
+        args = action_dict.get('args', {})
+        path = args.get('path', '')
+        command = args.get('command', 'view')
+        old_str = args.get('old_str')
+        new_str = args.get('new_str')
+        file_text = args.get('file_text')
+        view_range = args.get('view_range')
+        insert_line = args.get('insert_line')
+
+        return handle_file_edit(
+            path, bash_session.cwd, command,
+            old_str=old_str, new_str=new_str,
+            file_text=file_text, view_range=view_range,
+            insert_line=insert_line,
+        )
+
+    elif action_type == 'think':
+        return {
+            'observation': 'think',
+            'content': 'Your thought has been logged.',
+            'extras': {},
+        }
+
+    elif action_type == 'finish':
+        return {
+            'observation': 'agent_state_changed',
+            'content': '',
+            'extras': {},
+        }
+
+    else:
+        return {
+            'observation': 'error',
+            'content': f'Action type "{action_type}" is not supported by the thin executor.',
+            'extras': {},
+        }
+
+
+# ---------------------------------------------------------------------------
+# HTTP Server
+# ---------------------------------------------------------------------------
+class ThinExecutorHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the thin executor."""
+
+    # Shared state (set in the server)
+    bash_session = None
+    working_dir = '/workspace'
+
+    def log_message(self, format, *args):
+        """Suppress default logging to stderr."""
+        pass
+
+    def _send_json(self, data, status=200):
+        """Send a JSON response."""
+        body = json.dumps(data).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> bytes:
+        """Read the request body."""
+        content_length = int(self.headers.get('Content-Length', 0))
+        return self.rfile.read(content_length) if content_length > 0 else b''
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == '/alive':
+            self._send_json({'status': 'ok'})
+
+        elif path == '/server_info':
+            self._send_json({
+                'status': 'ok',
+                'uptime': time.time() - self.server.start_time,
+                'idle_time': 0,
+            })
+
+        elif path == '/download_files':
+            qs = parse_qs(parsed.query)
+            file_path = qs.get('path', [self.working_dir])[0]
+
+            if not os.path.exists(file_path):
+                self.send_error(404, f'Path not found: {file_path}')
+                return
+
+            # Create zip of the path
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                if os.path.isfile(file_path):
+                    zf.write(file_path, os.path.basename(file_path))
+                elif os.path.isdir(file_path):
+                    for root, dirs, files in os.walk(file_path):
+                        for f in files:
+                            fpath = os.path.join(root, f)
+                            arcname = os.path.relpath(fpath, os.path.dirname(file_path))
+                            zf.write(fpath, arcname)
+
+            zip_data = zip_buffer.getvalue()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Length', str(len(zip_data)))
+            self.end_headers()
+            self.wfile.write(zip_data)
+
+        else:
+            self.send_error(404, f'Not found: {path}')
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == '/execute_action':
+            try:
+                body = self._read_body()
+                data = json.loads(body)
+                action_dict = data.get('action', {})
+                result = route_action(action_dict, self.bash_session)
+                self._send_json(result)
+            except Exception as e:
+                self._send_json(
+                    {'observation': 'error', 'content': f'Internal error: {str(e)}', 'extras': {}},
+                    status=500,
+                )
+
+        elif path == '/list_files':
+            try:
+                body = self._read_body()
+                data = json.loads(body) if body else {}
+                list_path = data.get('path', self.working_dir)
+
+                if not os.path.exists(list_path):
+                    self._send_json([], status=200)
+                    return
+
+                entries = []
+                for entry in sorted(os.listdir(list_path)):
+                    full_path = os.path.join(list_path, entry)
+                    if os.path.isdir(full_path):
+                        entries.append(entry + '/')
+                    else:
+                        entries.append(entry)
+                self._send_json(entries)
+            except Exception as e:
+                self._send_json([], status=200)
+
+        elif path == '/upload_file':
+            try:
+                qs = parse_qs(parsed.query)
+                destination = qs.get('destination', ['/tmp'])[0]
+                recursive = qs.get('recursive', ['false'])[0].lower() == 'true'
+
+                content_type = self.headers.get('Content-Type', '')
+                body = self._read_body()
+
+                if 'multipart/form-data' in content_type:
+                    # Parse multipart form data
+                    boundary = content_type.split('boundary=')[1].strip()
+                    if boundary.startswith('"') and boundary.endswith('"'):
+                        boundary = boundary[1:-1]
+
+                    # Find the file content between boundaries
+                    boundary_bytes = f'--{boundary}'.encode()
+                    parts = body.split(boundary_bytes)
+
+                    for part in parts:
+                        if b'filename=' in part:
+                            # Extract filename
+                            header_end = part.index(b'\r\n\r\n')
+                            file_data = part[header_end + 4:]
+                            # Remove trailing \r\n-- if present
+                            if file_data.endswith(b'\r\n'):
+                                file_data = file_data[:-2]
+                            if file_data.endswith(b'--'):
+                                file_data = file_data[:-2]
+                            if file_data.endswith(b'\r\n'):
+                                file_data = file_data[:-2]
+
+                            if recursive:
+                                # file is a zip, extract it
+                                with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+                                    tmp.write(file_data)
+                                    tmp_path = tmp.name
+                                try:
+                                    with zipfile.ZipFile(tmp_path, 'r') as zf:
+                                        zf.extractall(destination)
+                                finally:
+                                    os.unlink(tmp_path)
+                            else:
+                                # Direct file upload
+                                os.makedirs(os.path.dirname(destination) or destination, exist_ok=True)
+                                with open(destination, 'wb') as f:
+                                    f.write(file_data)
+                            break
+                else:
+                    # Direct upload
+                    os.makedirs(os.path.dirname(destination) or destination, exist_ok=True)
+                    with open(destination, 'wb') as f:
+                        f.write(body)
+
+                self._send_json({'status': 'ok'})
+            except Exception as e:
+                self._send_json({'error': str(e)}, status=500)
+
+        else:
+            self.send_error(404, f'Not found: {path}')
+
+
+def run_server(port: int, working_dir: str = '/workspace'):
+    """Start the thin executor HTTP server."""
+    print(f'[thin_executor] Starting on port {port}, working_dir={working_dir}', flush=True)
+
+    # Create and start bash session
+    bash_session = BashSession(working_dir)
+    bash_session.start()
+
+    # Set shared state on handler class
+    ThinExecutorHandler.bash_session = bash_session
+    ThinExecutorHandler.working_dir = working_dir
+
+    server = HTTPServer(('0.0.0.0', port), ThinExecutorHandler)
+    server.start_time = time.time()
+
+    print(f'[thin_executor] Server ready on port {port}', flush=True)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        bash_session.close()
+        server.server_close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Thin Action Executor')
+    parser.add_argument('port', type=int, help='Port to listen on')
+    parser.add_argument('--working-dir', default='/workspace', help='Working directory')
+    args = parser.parse_args()
+
+    run_server(args.port, args.working_dir)

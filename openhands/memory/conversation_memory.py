@@ -32,6 +32,7 @@ from openhands.events.observation import (
     FileDownloadObservation,
     FileEditObservation,
     FileReadObservation,
+    FileWriteObservation,
     IPythonRunCellObservation,
     LoopDetectionObservation,
     TaskTrackingObservation,
@@ -452,6 +453,9 @@ class ConversationMemory:
             message = Message(
                 role='user', content=[TextContent(text=obs.content)]
             )  # Content is already truncated by openhands-aci
+        elif isinstance(obs, FileWriteObservation):
+            text = truncate_content(str(obs), max_message_chars)
+            message = Message(role='user', content=[TextContent(text=text)])
         elif isinstance(obs, BrowserOutputObservation):
             text = obs.content
             content = [TextContent(text=text)]
