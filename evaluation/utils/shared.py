@@ -73,6 +73,7 @@ class EvalOutput(BaseModel):
     ) = None
     metrics: dict[str, Any] | None = None
     error: str | None = None
+    status: str | None = None
 
     # Optionally save the input test instance
     instance: dict[str, Any] | None = None
@@ -345,13 +346,29 @@ def update_progress(
     pbar: tqdm,
     output_fp: TextIO,
 ):
-    """Update the progress bar and write the result to the output file."""
+    """Update the progress bar and write the result to the output file.
+
+    Skips writing to output.jsonl if the instance was skipped due to maximum
+    retries exceeded (status='skipped_max_retries'), so that re-runs will
+    automatically retry those instances.
+    """
     pbar.update(1)
     pbar.set_description(f'Instance {result.instance_id}')
     pbar.set_postfix_str(f'Test Result: {str(result.test_result)[:300]}...')
     logger.info(
         f'Finished evaluation for instance {result.instance_id}: {str(result.test_result)[:300]}...\n'
     )
+
+    # Don't write to output.jsonl if the instance was skipped due to max retries.
+    # These are already logged in maximum_retries_exceeded.jsonl and should be
+    # retried on the next run.
+    if getattr(result, 'status', None) == 'skipped_max_retries':
+        logger.info(
+            f'Instance {result.instance_id} skipped (max retries exceeded), '
+            f'not writing to output.jsonl so it will be retried on next run.'
+        )
+        return
+
     # Use os.write() for a single syscall – more atomic than buffered write+flush,
     # reducing the chance of a truncated line if the process is killed mid-write.
     line = (result.model_dump_json() + '\n').encode()
@@ -418,7 +435,7 @@ def log_skipped_maximum_retries_exceeded(instance, metadata, error, max_retries=
         instance_id=instance.instance_id,
         test_result={},
         error=f'Maximum retries ({max_retries}) reached: {str(error)}',
-        status='error',
+        status='skipped_max_retries',
     )
 
 

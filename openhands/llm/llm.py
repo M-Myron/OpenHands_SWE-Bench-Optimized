@@ -51,6 +51,7 @@ LLM_RETRY_EXCEPTIONS: tuple[type[Exception], ...] = (
     ServiceUnavailableError,
     litellm.Timeout,
     litellm.InternalServerError,
+    litellm.APIError,
     LLMNoResponseError,
 )
 
