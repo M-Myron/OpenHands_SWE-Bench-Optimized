@@ -98,11 +98,17 @@ def get_config_swegym_legacy(instance, metadata):
     - Disable think tool
     - Disable jupyter, browsing, mcp, prompt_extensions
     """
-    use_swebench_official_image = _run_infer_module.DATASET_TYPE != 'SWE-Gym'
-    base_container_image = get_instance_docker_image(
-        instance['instance_id'],
-        swebench_official_image=use_swebench_official_image,
-    )
+    if _run_infer_module.DATASET_TYPE == 'SWE-smith':
+        # SWE-smith provides its own image_name in the dataset
+        base_container_image = instance['image_name']
+        if not base_container_image.startswith('docker.io/'):
+            base_container_image = 'docker.io/' + base_container_image
+    else:
+        use_swebench_official_image = _run_infer_module.DATASET_TYPE != 'SWE-Gym'
+        base_container_image = get_instance_docker_image(
+            instance['instance_id'],
+            swebench_official_image=use_swebench_official_image,
+        )
     logger.info(f'Using instance container image: {base_container_image}.')
 
     sandbox_config = get_default_sandbox_config_for_eval()
@@ -223,6 +229,50 @@ if __name__ == '__main__':
             ]
         logger.info(
             f'{len(swe_bench_tests)} tasks left after filtering for SWE-Gym verified instances'
+        )
+
+    elif _run_infer_module.DATASET_TYPE == 'SWE-smith':
+        # Filter to real GitHub issue instances (PR Mirror) by default
+        include_all = os.environ.get('SWESMITH_INCLUDE_ALL', 'false').lower() == 'true'
+        if not include_all:
+            swesmith_filter_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'split',
+                'swesmith_real_instances.json',
+            )
+            if os.path.exists(swesmith_filter_path):
+                with open(swesmith_filter_path, 'r') as f:
+                    swesmith_real_ids = json.load(f)
+                swe_bench_tests = swe_bench_tests[
+                    swe_bench_tests['instance_id'].isin(swesmith_real_ids)
+                ]
+                logger.info(
+                    f'{len(swe_bench_tests)} tasks left after filtering for SWE-smith real (PR mirror) instances'
+                )
+            else:
+                swe_bench_tests = swe_bench_tests[
+                    swe_bench_tests['instance_id'].str.contains('.pr_', regex=False)
+                ]
+                logger.info(
+                    f'{len(swe_bench_tests)} tasks left after filtering for SWE-smith PR mirror instances (pattern match)'
+                )
+
+        # Add synthetic fields required by the pipeline
+        if 'base_commit' not in swe_bench_tests.columns:
+            swe_bench_tests['base_commit'] = 'SWESMITH_PENDING'
+        if 'version' not in swe_bench_tests.columns:
+            swe_bench_tests['version'] = swe_bench_tests['instance_id'].apply(
+                lambda x: x.split('.')[1] if '.' in x else 'unknown'
+            )
+        if 'test_patch' not in swe_bench_tests.columns:
+            swe_bench_tests['test_patch'] = ''
+        if 'hints_text' not in swe_bench_tests.columns:
+            swe_bench_tests['hints_text'] = ''
+        if 'created_at' not in swe_bench_tests.columns:
+            swe_bench_tests['created_at'] = ''
+
+        logger.info(
+            f'SWE-smith dataset prepared with {len(swe_bench_tests)} instances'
         )
 
     llm_config = None

@@ -97,6 +97,37 @@ if [ -z "$INSTANCE_ID" ]; then
     # Default to SWE-Bench-lite
     # change `--dataset_name` and `--split` to alter dataset
 
+    # get the "model_name_or_path" from the first line of the SWEBENCH_FORMAT_JSONL
+    MODEL_NAME_OR_PATH=$(jq -r '.model_name_or_path' $SWEBENCH_FORMAT_JSONL | head -n 1)
+    echo "MODEL_NAME_OR_PATH: $MODEL_NAME_OR_PATH"
+
+    RESULT_OUTPUT_DIR=$(dirname $SWEBENCH_FORMAT_JSONL)
+    echo "RESULT_OUTPUT_DIR: $RESULT_OUTPUT_DIR"
+
+    EVAL_TEMP_DIR=logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH
+    mkdir -p $RESULT_OUTPUT_DIR/eval_outputs
+    mkdir -p $EVAL_TEMP_DIR
+
+    # Restore previous results so SWE-bench skips already-evaluated instances
+    ALREADY_EVALED=$(find $RESULT_OUTPUT_DIR/eval_outputs -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    if [ "$ALREADY_EVALED" -gt 0 ]; then
+        echo "Found $ALREADY_EVALED already-evaluated instances in $RESULT_OUTPUT_DIR/eval_outputs. Copying them so they will be skipped..."
+        cp -r $RESULT_OUTPUT_DIR/eval_outputs/* $EVAL_TEMP_DIR/ 2>/dev/null || true
+    fi
+
+    # Trap to copy results from temp dir to final dir on exit (normal, error, or interrupt)
+    function copy_eval_results() {
+        echo ""
+        echo "Copying evaluation results from $EVAL_TEMP_DIR to $RESULT_OUTPUT_DIR/eval_outputs ..."
+        if [ -d "$EVAL_TEMP_DIR" ]; then
+            cp -r $EVAL_TEMP_DIR/* $RESULT_OUTPUT_DIR/eval_outputs/ 2>/dev/null || true
+            echo "Done copying evaluation results."
+            # Clean up temp dir after copying
+            rm -rf logs/run_evaluation/$RUN_ID 2>/dev/null || true
+        fi
+    }
+    trap copy_eval_results EXIT
+
     poetry run python -m swebench.harness.run_evaluation \
         --dataset_name "$DATASET_NAME" \
         --split "$SPLIT" \
@@ -108,22 +139,6 @@ if [ -z "$INSTANCE_ID" ]; then
         $MODAL_FLAG
     EVAL_EXIT_CODE=$?
 
-    # get the "model_name_or_path" from the first line of the SWEBENCH_FORMAT_JSONL
-    MODEL_NAME_OR_PATH=$(jq -r '.model_name_or_path' $SWEBENCH_FORMAT_JSONL | head -n 1)
-    echo "MODEL_NAME_OR_PATH: $MODEL_NAME_OR_PATH"
-
-    RESULT_OUTPUT_DIR=$(dirname $SWEBENCH_FORMAT_JSONL)
-    echo "RESULT_OUTPUT_DIR: $RESULT_OUTPUT_DIR"
-
-    # move the eval results to the target directory
-    mkdir -p $RESULT_OUTPUT_DIR
-    # rm eval_outputs directory if it exists
-    if [ -d $RESULT_OUTPUT_DIR/eval_outputs ]; then
-        rm -rf $RESULT_OUTPUT_DIR/eval_outputs
-    fi
-
-    mv logs/run_evaluation/$RUN_ID/$MODEL_NAME_OR_PATH $RESULT_OUTPUT_DIR
-    mv $RESULT_OUTPUT_DIR/$MODEL_NAME_OR_PATH $RESULT_OUTPUT_DIR/eval_outputs
     echo "RUN_ID: $RUN_ID" > $RESULT_OUTPUT_DIR/run_id.txt
 
     # move report file

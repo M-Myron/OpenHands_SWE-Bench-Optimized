@@ -1,11 +1,11 @@
-"""Instance-major Oracle-Triad evaluation runner.
+"""Instance-major Oracle-Guided evaluation runner.
 
 Schedules work as: instance1_run1..runN, instance2_run1..runN, ...
 This avoids waiting for the slowest instance in a batch before the next
 batch starts—every worker processes one instance through all runs and
 immediately picks up the next available instance.
 
-Drop-in replacement for ``run_infer_oracle_triad.py`` with better
+Drop-in replacement for ``run_infer_oracle_guided.py`` with better
 throughput when NUM_WORKERS < total instances.
 """
 
@@ -29,14 +29,13 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 import openhands.agenthub  # noqa: F401
-import openhands.agenthub.oracle_triad_codeact_agent  # noqa: F401
+import openhands.agenthub.oracle_guided_codeact_agent  # noqa: F401
 from evaluation.benchmarks.swe_bench_optimized import run_infer as base
 from evaluation.benchmarks.swe_bench_optimized.run_infer import (
     AGENT_CLS_TO_FAKE_USER_RESPONSE_FN,
 )
-from evaluation.benchmarks.swe_bench_optimized.run_infer_oracle_triad import (
+from evaluation.benchmarks.swe_bench_optimized.run_infer_oracle_guided import (
     _build_issue_understanding,
-    _load_preprocess_analysis,
     _load_react_facts,
     _write_oracle_context_file,
 )
@@ -52,7 +51,7 @@ from evaluation.utils.shared import (
     prepare_dataset,
     timeout,
 )
-from openhands.agenthub.oracle_triad_codeact_agent.oracle_triad_codeact_agent import (
+from openhands.agenthub.oracle_guided_codeact_agent.oracle_guided_codeact_agent import (
     clear_triage_log,
     read_and_clear_triage_log,
 )
@@ -80,8 +79,8 @@ from evaluation.benchmarks.swe_bench_optimized.run_infer_instance_major import (
 # ---------------------------------------------------------------------------
 # Fake user response registration
 # ---------------------------------------------------------------------------
-AGENT_CLS_TO_FAKE_USER_RESPONSE_FN['OracleTriadCodeActAgent'] = (
-    AGENT_CLS_TO_FAKE_USER_RESPONSE_FN['CodeActAgent']
+AGENT_CLS_TO_FAKE_USER_RESPONSE_FN['OracleGuidedCodeActAgent'] = (
+    AGENT_CLS_TO_FAKE_USER_RESPONSE_FN.get('CodeActAgent')
 )
 
 
@@ -127,41 +126,41 @@ def _is_immediate_max_iteration_error(
 
 
 # ---------------------------------------------------------------------------
-# Core per-instance processing (Oracle-Triad specific)
+# Core per-instance processing (Oracle-Guided specific)
 # ---------------------------------------------------------------------------
 
-def _process_oracle_triad_instance_with_sid(
+def _process_oracle_guided_instance_with_sid(
     instance: pd.Series,
     metadata: EvalMetadata,
     sid: str,
     reset_logger: bool = True,
     runtime_failure_count: int = 0,
 ) -> EvalOutput:
-    """Process one instance with Oracle-Triad context setup + deterministic sid."""
+    """Process one instance with Oracle-Guided context setup + deterministic sid."""
     if reset_logger:
         log_dir = os.path.join(metadata.eval_output_dir, 'infer_logs')
         _reset_worker_logger_quietly(logger, instance.instance_id, log_dir)
 
-    # ---- Oracle-Triad context setup ----
+    # ---- Oracle-Guided context setup ----
     clear_triage_log()
     context_path = _write_oracle_context_file(instance, metadata)
-    os.environ['ORACLE_PLANNER_CONTEXT_PATH'] = context_path
+    os.environ['ORACLE_GUIDED_CONTEXT_PATH'] = context_path
 
-    save_planner = os.environ.get('ORACLE_PLANNER_SAVE_PROMPTS', '0').strip() == '1'
+    save_planner = os.environ.get('GUIDED_SAVE_PLANNER_PROMPTS', '1').strip() == '1'
     if save_planner:
-        os.environ['ORACLE_PLANNER_SAVE_PROMPTS_DIR'] = os.path.join(
-            metadata.eval_output_dir, 'oracle_planner_prompts', str(instance.instance_id),
+        os.environ['GUIDED_PLANNER_SAVE_PROMPTS_DIR'] = os.path.join(
+            metadata.eval_output_dir, 'oracle_guided_planner_prompts', str(instance.instance_id),
         )
     else:
-        os.environ.pop('ORACLE_PLANNER_SAVE_PROMPTS_DIR', None)
+        os.environ.pop('GUIDED_PLANNER_SAVE_PROMPTS_DIR', None)
 
-    save_critic = os.environ.get('ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS', '0').strip() == '1'
+    save_critic = os.environ.get('GUIDED_SAVE_CRITIC_PROMPTS', '1').strip() == '1'
     if save_critic:
-        os.environ['ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS_DIR'] = os.path.join(
-            metadata.eval_output_dir, 'oracle_proposal_critic_prompts', str(instance.instance_id),
+        os.environ['GUIDED_CRITIC_SAVE_PROMPTS_DIR'] = os.path.join(
+            metadata.eval_output_dir, 'oracle_guided_critic_prompts', str(instance.instance_id),
         )
     else:
-        os.environ.pop('ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS_DIR', None)
+        os.environ.pop('GUIDED_CRITIC_SAVE_PROMPTS_DIR', None)
 
     # ---- Standard SWE-bench instance processing ----
     config = base.get_config(instance, metadata)
@@ -203,26 +202,32 @@ def _process_oracle_triad_instance_with_sid(
         git_patch = return_val['git_patch']
     finally:
         runtime.close()
-        os.environ.pop('ORACLE_PLANNER_CONTEXT_PATH', None)
-        os.environ.pop('ORACLE_PLANNER_SAVE_PROMPTS_DIR', None)
-        os.environ.pop('ORACLE_PROPOSAL_CRITIC_SAVE_PROMPTS_DIR', None)
+        os.environ.pop('ORACLE_GUIDED_CONTEXT_PATH', None)
+        os.environ.pop('GUIDED_PLANNER_SAVE_PROMPTS_DIR', None)
+        os.environ.pop('GUIDED_CRITIC_SAVE_PROMPTS_DIR', None)
 
-    # ---- Collect triad log ----
-    triad_log = read_and_clear_triage_log()
-    triad_log_dir = os.path.join(metadata.eval_output_dir, 'oracle_triad_logs')
-    os.makedirs(triad_log_dir, exist_ok=True)
-    triad_log_path = os.path.join(triad_log_dir, f'{instance.instance_id}.jsonl')
-    with open(triad_log_path, 'w', encoding='utf-8') as f:
-        for entry in triad_log:
+    # ---- Collect guided log ----
+    guided_log = read_and_clear_triage_log()
+    guided_log_dir = os.path.join(metadata.eval_output_dir, 'oracle_guided_logs')
+    os.makedirs(guided_log_dir, exist_ok=True)
+    guided_log_path = os.path.join(guided_log_dir, f'{instance.instance_id}.jsonl')
+    with open(guided_log_path, 'w', encoding='utf-8') as f:
+        for entry in guided_log:
             f.write(json.dumps(entry) + '\n')
 
-    test_result = {'git_patch': git_patch, 'oracle_triad_log': triad_log}
+    test_result = {'git_patch': git_patch, 'oracle_guided_log': guided_log}
     histories = [event_to_dict(event) for event in state.history]
     metrics = base.get_metrics(state)
 
+    instruction = message_action.content
+    if message_action.image_urls:
+        instruction += (
+            '\n\n<image_urls>' + '\n'.join(message_action.image_urls) + '</image_urls>'
+        )
+
     return EvalOutput(
         instance_id=instance.instance_id,
-        instruction=message_action.content,
+        instruction=instruction,
         instance=instance.to_dict(),
         test_result=test_result,
         metadata=metadata,
@@ -254,11 +259,11 @@ def _run_single_with_retries(
         try:
             if timeout_seconds is not None:
                 with timeout(timeout_seconds):
-                    return _process_oracle_triad_instance_with_sid(
+                    return _process_oracle_guided_instance_with_sid(
                         instance, metadata, sid=sid,
                         reset_logger=True, runtime_failure_count=runtime_failure_count,
                     )
-            return _process_oracle_triad_instance_with_sid(
+            return _process_oracle_guided_instance_with_sid(
                 instance, metadata, sid=sid,
                 reset_logger=True, runtime_failure_count=runtime_failure_count,
             )
@@ -445,7 +450,8 @@ if __name__ == '__main__':
     args, _ = parser.parse_known_args()
 
     if not args.agent_cls or args.agent_cls == 'CodeActAgent':
-        args.agent_cls = 'OracleTriadCodeActAgent'
+        args.agent_cls = 'OracleGuidedCodeActAgent'
+        logger.info('Using default agent class: OracleGuidedCodeActAgent')
 
     # Execution salt for unique SIDs
     if not os.environ.get('OH_EVAL_EXECUTION_SALT'):
@@ -485,9 +491,26 @@ if __name__ == '__main__':
         swe_bench_tests = swe_bench_tests[has_facts]
         logger.info(f'Fact JSON filter: {before_count} → {len(swe_bench_tests)} instances')
 
+    # Skip instances listed in the graph complexity filter JSON
+    graph_filter_path = os.environ.get('ORACLE_GRAPH_FILTER_JSON', '').strip()
+    if graph_filter_path and os.path.isfile(graph_filter_path):
+        with open(graph_filter_path, 'r') as _gf:
+            _graph_filter = json.load(_gf)
+        _filtered_ids = set(_graph_filter.get('filtered_instance_ids', []))
+        before_count = len(swe_bench_tests)
+        swe_bench_tests = swe_bench_tests[
+            ~swe_bench_tests['instance_id'].isin(_filtered_ids)
+        ]
+        logger.info(
+            f'Graph complexity filter: {before_count} → {len(swe_bench_tests)} instances '
+            f'(removed {before_count - len(swe_bench_tests)} at p{_graph_filter.get("thresholds", {}).get("percentile", 95)})'
+        )
+    elif graph_filter_path:
+        logger.warning(f'ORACLE_GRAPH_FILTER_JSON not found: {graph_filter_path}')
+
     logger.info(f'Loaded {args.dataset} ({args.split}): {len(swe_bench_tests)} tasks')
 
-    # Filter for SWE-Gym verified instances (same as base instance-major runner)
+    # Filter for SWE-Gym verified instances
     if base.DATASET_TYPE == 'SWE-Gym':
         verified_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -508,10 +531,10 @@ if __name__ == '__main__':
         for col in ['PASS_TO_PASS', 'FAIL_TO_PASS']:
             swe_bench_tests[col] = swe_bench_tests[col].apply(lambda x: str(x))
 
-    # Load TriadConfig early
-    from openhands.agenthub.oracle_triad_codeact_agent.triad_config import TriadConfig
-    _triad_cfg = TriadConfig.load()
-    _triad_cfg.export_to_env()
+    # Load GuidedConfig early
+    from openhands.agenthub.oracle_guided_codeact_agent.guided_config import GuidedConfig
+    _cfg = GuidedConfig.load()
+    _cfg.export_to_env()
 
     llm_config = get_llm_config_arg(args.llm_config, args.config_file)
     if llm_config is None:
@@ -583,7 +606,7 @@ if __name__ == '__main__':
     total_pending = sum(run_context[r]['pending_count'] for r in active_runs)
 
     logger.info('=' * 80)
-    logger.info('ORACLE TRIAD EVALUATION PLAN (INSTANCE-MAJOR):')
+    logger.info('ORACLE GUIDED EVALUATION PLAN (INSTANCE-MAJOR):')
     logger.info(f'  Total instances in dataset:  {len(swe_bench_tests)}')
     logger.info(f'  Instances with pending runs: {total_instances}')
     logger.info(f'  Runs per instance:           {n_runs}')
@@ -593,6 +616,28 @@ if __name__ == '__main__':
         ctx = run_context[run_id]
         logger.info(f'  Run {run_id}: completed={len(ctx["completed_ids"])}, pending={ctx["pending_count"]}')
     logger.info(f'  Total pending evaluations:   {total_pending}')
+    logger.info(
+        f'  Guided env var overrides (unset = YAML/default):'
+    )
+    _GUIDED_VARS = [
+        'GUIDED_NUM_CANDIDATES',
+        'GUIDED_PLANNER_MAX_RETRIES',
+        'GUIDED_PLANNER_HISTORY_NEAR_WINDOW',
+        'GUIDED_PLANNER_LLM_CONFIG',
+        'GUIDED_CRITIC_LLM_CONFIG',
+        'GUIDED_SAVE_PLANNER_PROMPTS',
+        'GUIDED_SAVE_CRITIC_PROMPTS',
+        'GUIDED_PLANNER_JSON_PARSE_MAX_RETRIES',
+        'GUIDED_CRITIC_JSON_PARSE_MAX_RETRIES',
+    ]
+    _any_set = False
+    for _v in _GUIDED_VARS:
+        val = os.environ.get(_v)
+        if val is not None:
+            logger.info(f'    {_v}={val}')
+            _any_set = True
+    if not _any_set:
+        logger.info('    (none — using YAML config / Python defaults)')
     logger.info('=' * 80)
 
     if total_instances == 0:
@@ -633,7 +678,7 @@ if __name__ == '__main__':
             for task in instance_tasks
         ]
 
-        with tqdm(total=total_pending, desc='Oracle-Triad evaluations') as pbar:
+        with tqdm(total=total_pending, desc='Oracle-Guided evaluations') as pbar:
             pending = list(async_results)
             while pending:
                 drained_any = False
@@ -725,7 +770,7 @@ if __name__ == '__main__':
     elapsed = time.time() - start
     logger.info('')
     logger.info('╔═══════════════════════════════════════════════════════════════════════════╗')
-    logger.info('║ ALL ORACLE-TRIAD EVALUATIONS COMPLETE!')
+    logger.info('║ ALL ORACLE-GUIDED EVALUATIONS COMPLETE!')
     logger.info(
         f'║ Processed instances: {completed_instances}/{total_instances} '
         f'| Total time: {_format_time(elapsed)}'
@@ -733,7 +778,7 @@ if __name__ == '__main__':
     logger.info('╚═══════════════════════════════════════════════════════════════════════════╝')
     logger.info('')
 
-    # Check for maximum-retries-exceeded markers (same as base)
+    # Check for maximum-retries-exceeded markers
     for run_id in active_runs:
         eval_output_dir = os.path.dirname(run_context[run_id]['output_file'])
         check_maximum_retries_exceeded(eval_output_dir)

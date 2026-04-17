@@ -1,4 +1,4 @@
-# Oracle Triad Agent — Usage Guide
+ the oracle planner should be able to see the fact usage tracker, like # Oracle Triad Agent — Usage Guide
 
 **Module:** `openhands/agenthub/oracle_triad_codeact_agent/`  
 **Evaluation Entry:** `evaluation/benchmarks/swe_bench_optimized/`

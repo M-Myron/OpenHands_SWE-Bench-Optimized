@@ -480,6 +480,27 @@ def initialize_runtime(
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(obs.exit_code == 0, f'Failed to remove git remotes: {str(obs)}')
 
+    # Truncate git history to prevent the agent from viewing commits after base_commit
+    # (which could contain the golden patch / fix for this issue).
+    # Strategy: delete all branch/tag refs pointing beyond base_commit, then GC.
+    base_commit = instance['base_commit']
+    truncate_cmd = (
+        f'for branch in $(git for-each-ref --format="%(refname:short)" refs/heads/); do '
+        f'git branch -D "$branch" 2>/dev/null; done && '
+        f'for tag in $(git for-each-ref --format="%(refname:short)" refs/tags/); do '
+        f'git tag -d "$tag" 2>/dev/null; done && '
+        f'git checkout -b main {base_commit} 2>/dev/null; '
+        f'git reflog expire --expire=now --all && '
+        f'git gc --prune=now'
+    )
+    action = CmdRunAction(command=truncate_cmd)
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    if obs.exit_code != 0:
+        logger.warning(f'Failed to truncate git history (non-fatal): {str(obs)}')
+
     if metadata.details['mode'] == 'swt-ci':
         # set up repo
         setup_commands = []

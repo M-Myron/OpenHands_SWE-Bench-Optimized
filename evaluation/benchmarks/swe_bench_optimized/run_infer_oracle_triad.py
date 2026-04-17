@@ -292,6 +292,26 @@ if __name__ == '__main__':
         if missing:
             logger.warning(f'Instance IDs not found in dataset: {missing}')
 
+    # Skip instances without preprocessed fact JSON files early
+    preprocess_dir = os.environ.get('ORACLE_PREPROCESS_DIR', '').strip()
+    if preprocess_dir:
+        before_count = len(swe_bench_tests)
+        has_facts = swe_bench_tests['instance_id'].apply(
+            lambda iid: os.path.isfile(
+                os.path.join(preprocess_dir, str(iid), 'stage2_facts.json')
+            )
+        )
+        skipped = swe_bench_tests[~has_facts]['instance_id'].tolist()
+        if skipped:
+            logger.warning(
+                f'Skipping {len(skipped)} instances without fact JSON: '
+                f'{skipped[:10]}{"..." if len(skipped) > 10 else ""}'
+            )
+        swe_bench_tests = swe_bench_tests[has_facts]
+        logger.info(
+            f'Fact JSON filter: {before_count} → {len(swe_bench_tests)} instances'
+        )
+
     logger.info(
         f'Loaded dataset {args.dataset} ({args.split}): {len(swe_bench_tests)} tasks'
     )

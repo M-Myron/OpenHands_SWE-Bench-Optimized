@@ -122,6 +122,8 @@ if [ -z "$INSTANCE_ID" ]; then
         if [ -d "$EVAL_TEMP_DIR" ]; then
             cp -r $EVAL_TEMP_DIR/* $RESULT_OUTPUT_DIR/eval_outputs/ 2>/dev/null || true
             echo "Done copying evaluation results."
+            # Clean up temp dir after copying
+            rm -rf logs/run_evaluation/$RUN_ID 2>/dev/null || true
         fi
     }
     trap copy_eval_results EXIT
@@ -135,9 +137,6 @@ if [ -z "$INSTANCE_ID" ]; then
         --max_workers $N_PROCESS \
         --run_id $RUN_ID \
         $MODAL_FLAG
-
-    # The trap will copy results on exit. Also clean up temp dir.
-    rm -rf logs/run_evaluation/$RUN_ID 2>/dev/null || true
 
     echo "RUN_ID: $RUN_ID" > $RESULT_OUTPUT_DIR/run_id.txt
 
