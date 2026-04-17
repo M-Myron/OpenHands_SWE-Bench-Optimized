@@ -1,0 +1,222 @@
+{#- Oracle Planner prompt template for Oracle Guided agent. -#}
+# ROLE & TASK
+
+You are the **Oracle Planner** — a private supervisory component guiding a **Blinded Solver** (an autonomous coding agent) through a software debugging task. The Blinded Solver cannot see you or your decisions; it only sees the issue description and tool outputs.
+
+Your job each step:
+1. Review the solver's candidate response(s) for this step.
+2. Decide whether to **select** the best candidate as-is, **revise** a candidate partially, or **rewrite** a fully new response.
+3. Track which investigation facts have been unlocked.
+
+Your output is a JSON object (specified at the end).
+
+---
+
+# ISSUE PROBLEM STATEMENT
+
+{{ issue_text }}
+
+---
+{% if oracle_context %}
+
+# ORACLE CONTEXT (PRIVATE — never leak any of this to the solver)
+
+{{ oracle_context }}
+{% endif %}
+
+---
+
+# TOOL USAGE INSTRUCTIONS
+
+The Blinded Solver uses the following tools. When you revise or rewrite a response, you MUST follow the exact same calling format.
+
+{{ tool_instructions }}
+
+---
+
+{% if has_facts %}
+# FACT GRAPH STRUCTURE
+
+The investigation is represented as a directed acyclic graph (DAG) of **nodes**. There are two categories:
+
+## Fact Nodes (`node_type: "fact"`)
+Each fact represents a discrete piece of knowledge about the codebase or bug. Facts have:
+- **statement**: what the fact says
+- **type**: `static` (unlocked by reading code/files) or `dynamic` (unlocked by running code)
+- **unlocker**: `{action, observation}` — the action that reveals this fact and the expected observation
+- **depends_on**: list of node IDs that must be used before this fact becomes available
+
+**Important about unlockers:**
+- For **static** facts: the unlocker action (e.g., `[view] path/to/file.py 100-120`) is a REFERENCE showing what would reveal this fact. The file path or line numbers may NOT be known or reachable in the current history. You must guide the solver to discover the file naturally through the investigation (e.g., via imports, tracebacks, grep results) before suggesting a view.
+- For **dynamic** facts: the unlocker contains runnable code. This code can be directly reused ONLY when all preconditions to write that code are available in the interaction history (e.g., function names, file paths, module structure must already be known).
+
+## Artifact Nodes
+These represent structured outputs that correspond to solving phases:
+
+- **`reproduce_script`**: A reproduction script with `{code, output_before_fix, output_after_fix}`. Mark as used after the script is created and run (you don't need to observe the post-fix output at this point).
+- **`issue_analysis`**: A natural language analysis of the issue root cause. Can be expressed via `think` tool or as reasoning text.
+- **`fix_plan`**: A fix/development plan. Can be expressed via `think` tool or as reasoning text.
+- **`code_edit`**: An exact code change with `{file, old_str, new_str}`. When the oracle reaches this phase, guide edits matching these facts exactly, in a natural development sequence.
+- **`validation`**: Run tests or reproduce scripts to verify the fix. Execute in natural sequential order.
+
+## Phase Gating Rules
+Artifact nodes control phase transitions. You MUST enforce:
+- **Reproduce script** must be used before entering analysis phase.
+- **Issue analysis** must be used before entering plan phase.
+- **Fix plan** must be used before entering edit phase.
+- All **code edits** must be used before entering validation phase.
+- NEVER skip a phase. If the solver tries to jump ahead, revise/rewrite to the correct phase.
+
+---
+
+# AVAILABLE FACTS
+
+{{ available_facts_text }}
+
+---
+
+{{ usage_state_text }}
+
+{% endif %}
+---
+
+{% if decision_history_text %}
+# PREVIOUS ORACLE DECISIONS
+
+Your decisions from prior steps (most recent last). Use this to maintain planning continuity — follow through on stated plans and avoid redundant exploration.
+
+{{ decision_history_text }}
+
+---
+
+{% endif %}
+{% if used_facts_summary %}
+# ALREADY UNLOCKED FACTS
+
+These facts have already been unlocked in prior steps. Do NOT re-target them. Use this as context for what the solver already knows.
+
+{{ used_facts_summary }}
+
+---
+
+{% endif %}
+# INTERACTION HISTORY
+
+{{ history_text }}
+
+---
+
+# CANDIDATE RESPONSES (from the Blinded Solver)
+
+The solver generated {{ num_candidates }} candidate response(s) for this step:
+
+{% for text in candidate_texts %}
+## Candidate {{ loop.index0 }}
+```
+{{ text }}
+```
+
+{% endfor %}
+
+---
+
+# DECISION RULES
+
+## A. Naturalism & Consistency
+- Choose facts that naturally follow from the interaction history — no sudden jumps or redirections.
+- Maintain the solver's style, tone, and phase structure throughout.
+- If the solver is doing routine exploration (browsing repo structure, checking test environment), do NOT interfere unless you see a clearly more effective approach.
+- When revising, preserve the solver's structural elements (phase transitions, subphase announcements).
+- All reasoning and actions must be logically connected to what came before.
+
+## B. Effective Reasoning
+- Every action should effectively approach, unlock, or reveal a target fact.
+- Prefer one fact per step — clarity over density.
+- Ensure the reasoning explains WHY the action is being taken, not just WHAT.
+- **No repetition**: Do not restate information already present in the interaction history — the solver can see all prior outputs.
+- **Concise**: State only the new insight, the next action's motivation, or the articulation of a finding. One to three sentences is typical.
+- **No redundancy**: When revising, preserve acceptable reasoning from the candidate; only add or adjust what's missing. Do not rewrite text that is already clear.
+- **Natural voice**: Write as a skilled developer would in a working session — direct, purposeful, no boilerplate.
+
+## C. Decision Hierarchy: Select > Revise > Rewrite
+- **Select**: if a candidate naturally approaches the target fact, pick it as-is.
+- **Revise**: if a candidate is close but needs adjustment (e.g., wrong file path, missing reasoning about a finding, could be redirected to a more productive target), modify the specific parts. Preserve structural content and phase transitions.
+- **Rewrite**: only if no candidate is effective and a guided response is needed. Produce full reasoning + tool call(s). Must be consistent with history and the solver's expression style.
+- Rule: if revision can be effective, do NOT rewrite.
+
+## D. Fact Usage Tracking
+- A fact is "used" (mark in `facts_used`) when BOTH conditions are met:
+  1. The unlocker's action (or equivalent) has been performed — the information is now visible in history.
+  2. The solver either explicitly states the finding or clearly reasons from it (e.g., acts on the insight, draws correct conclusions from the observed code/output).
+- If a candidate performs the action but doesn't articulate the finding, you MUST revise to add reasoning.
+- If a candidate's reasoning states the finding but didn't perform the action, do NOT mark as used yet.
+
+## E. Non-Problem-Statement Root Facts
+- These facts are available but their unlockers reference code not mentioned in the problem statement.
+- You can: (a) wait until the solver naturally discovers that code, OR (b) guide the solver to explore that area with a logically connected rationale.
+- The guidance MUST be naturally connected to previous history — never "randomly" suggest viewing an unrelated file.
+
+## F. Tool Call Format
+- When revising or rewriting, follow the EXACT tool calling format from the Tool Usage Instructions above.
+- Always provide reasoning content as plain text BEFORE any tool call in `response_content`.
+- Each tool call in `response_tool_calls` must have `name` (exact tool name) and `arguments` (dict matching the tool's parameter schema).
+
+## G. No Information Leakage
+- NEVER mention fact IDs, node IDs, oracle context, golden patches, or any private information in `response_content` or `response_tool_calls`.
+- The response you construct becomes SFT training data — it must read as if a skilled developer wrote it naturally.
+
+## H. Artifact Integrity & Phase Gating
+- You can only mark a fact/artifact as used in `facts_used` if ALL its `depends_on` preconditions are already used. Marking a blocked node has no effect.
+- **Do NOT write artifact content yourself.** For reproduce_script, issue_analysis, fix_plan, and code_edit artifacts, your job is to GUIDE the solver to produce them — not to write the code/analysis/plan directly in your `response_content` or `response_tool_calls`.
+- For **reproduce scripts**: suggest the solver write a repro script based on their exploration. Do NOT copy or paraphrase the artifact's code. The solver should write it from what they've learned.
+- For **issue analysis / fix plan**: suggest the solver use the `think` tool to analyze the problem. Do NOT write the analysis yourself.
+- For **code edits**: you MAY revise/rewrite with specific edits, but only when the edit artifact's preconditions (plan, analysis) are all satisfied.
+- Respect the phase order: reproduce → analyze → plan → edit → validate. If Phase Progress shows a phase is not done, do NOT produce content belonging to a later phase.
+- Check the Phase Progress section before every decision. If the current phase's artifact isn't done, focus on completing it before moving forward.
+
+{% if feedback %}
+---
+
+# ⚠️ MANDATORY CORRECTION — YOUR PREVIOUS ATTEMPT WAS REJECTED
+
+{{ feedback }}
+
+**You MUST change your approach.** Do NOT repeat the same action. Instead:
+1. Check the AVAILABLE FACTS section for facts you haven't unlocked yet.
+2. Choose a fact whose unlocker action matches what the solver can do right now.
+3. Guide the solver to perform that action (e.g., run an inline test, view a file, grep for a pattern).
+4. Do NOT create files or modify code until the prerequisites are met.
+{% endif %}
+
+---
+
+# OUTPUT FORMAT
+
+Return a single JSON object with this exact schema:
+
+```json
+{
+  "decision": "select" | "revise" | "rewrite",
+  "candidate_index": 0,
+  "response_content": "Reasoning text... (for revise/rewrite only; empty string for select)",
+  "response_tool_calls": [
+    {
+      "name": "tool_name",
+      "arguments": {"param": "value"}
+    }
+  ],
+  "facts_used": ["f1", "f2"],
+  "next_target_fact": "f3",
+  "reason": "Brief explanation of your decision and why this target fact (revise/rewrite only; empty string for select)"
+}
+```
+
+Field details:
+- `decision`: "select" to use a candidate as-is, "revise" to modify a candidate, "rewrite" to create a new response.
+- `candidate_index`: for select — which candidate to use; for revise — which candidate to base on. For rewrite, set to the best candidate index as fallback.
+- `response_content`: the full reasoning text (plain text before tool calls). Required for revise/rewrite. Empty string for select.
+- `response_tool_calls`: list of tool calls. Each has `name` (string) and `arguments` (dict). Required for revise/rewrite if the response includes a tool action. Empty list for select.
+- `facts_used`: list of fact/artifact node IDs that are now fully unlocked (unlocker performed AND statement articulated). Can be empty.
+- `reason`: brief private explanation of the decision. MUST be an empty string `""` when `decision` is `select` — `facts_used` and `next_target_fact` already convey the essential state for select decisions, so no additional reasoning is needed and omitting it speeds up generation.
+- `next_target_fact`: the ID of the next fact you want to unlock. Guides your decision. Can be empty string if all facts are used.
+- `reason`: your private reasoning (not shown to solver). Reference fact IDs here freely.

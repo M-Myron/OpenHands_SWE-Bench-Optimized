@@ -1,0 +1,37 @@
+# Oracle Guided Agent — Default Configuration Reference
+#
+# This file is a TEMPLATE — it is never auto-loaded.
+# Copy it and set ORACLE_GUIDED_CONFIG=/path/to/your_copy.yaml
+# Only include keys you want to change; missing keys use Python defaults.
+
+
+oracle_context:
+  include_golden_patch: false
+  include_golden_test_patch: false
+  include_issue_understanding: false
+  include_react_facts: true
+
+planner:
+  history_near_window: 5      # near interactions: action + observation; older: action only
+  include_system_instruction: false  # include solver system prompt in planner history
+  llm_config: oracle_planner  # config.toml section name
+  json_parse_max_retries: 3
+
+critic:
+  llm_config: blinded_critic  # config.toml section name
+  json_parse_max_retries: 3
+  enable_symbolic_checks: true  # when false, skip regex extraction + recheck LLM call (faster)
+
+agent:
+  num_candidates: 1            # blinded solver candidates per step
+  planner_max_retries: 2       # max critic (leakage) retries per step
+  gate_max_retries: 2           # max stage-gate retries per step
+  oracle_start_step: 0          # oracle activates at this step (0 = always on)
+  oracle_auto_activate: false   # auto-detect Phase 3 header to activate oracle
+  oracle_auto_activate_fallback_step: 5  # activate oracle after this step if Phase 3 not detected
+  transient_retries: 5           # max retries for transient LLM errors (502, timeout, etc.)
+  retry_base_wait: 10            # base wait seconds; doubles each retry (10, 20, 40, 80, 160)
+
+debug:
+  save_planner_prompts: true
+  save_critic_prompts: true

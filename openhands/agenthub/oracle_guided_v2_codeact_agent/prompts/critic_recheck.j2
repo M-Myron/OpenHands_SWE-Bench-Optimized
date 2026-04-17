@@ -1,0 +1,75 @@
+{#- Critic recheck prompt: re-evaluate failed symbolic regex checks. -#}
+# TASK
+
+Some symbolic regex checks failed when run against the interaction history. Your job is to determine whether each failure is a **valid rejection** (the knowledge truly isn't in history) or a **false positive** (the knowledge IS present but the regex didn't match due to formatting, aliasing, or indirect reference).
+
+---
+
+# PROPOSED RESPONSE (being validated)
+
+```
+{{ oracle_response_text }}
+```
+
+---
+
+# INTERACTION HISTORY (search target)
+
+{{ history_text }}
+
+---
+
+# FAILED CHECKS
+
+The following regex patterns did NOT match anywhere in the interaction history:
+
+{% for check in failed_checks %}
+## Check {{ loop.index }}
+- **Description**: {{ check.description }}
+- **Regex**: `{{ check.regex }}`
+- **Matched**: No
+{% endfor %}
+
+---
+
+# INSTRUCTIONS
+
+For each failed check above, determine:
+
+1. **Is the knowledge actually present in the interaction history?** It might be expressed differently than the regex expected — e.g., the file path might appear via an import statement, a traceback, or a different path format. The symbol might appear as part of a larger expression.
+
+2. **Is the rejection valid?** If the knowledge truly cannot be found in or inferred from the history, the rejection is valid. If it CAN be found (even indirectly), the rejection is a false positive and should be dismissed.
+
+---
+
+# OUTPUT FORMAT
+
+Return a JSON object:
+
+```json
+{
+  "results": [
+    {
+      "check_index": 1,
+      "description": "...",
+      "regex": "...",
+      "reject_valid": true,
+      "reason": "The file path 'foo/bar.py' does not appear anywhere in history and cannot be inferred from any import or traceback."
+    },
+    {
+      "check_index": 2,
+      "description": "...",
+      "regex": "...",
+      "reject_valid": false,
+      "reason": "The symbol 'MyClass' appears in the traceback at step 3, so the knowledge is available."
+    }
+  ]
+}
+```
+
+For each result:
+- `check_index`: which check (1-indexed)
+- `description`: copy from the failed check
+- `regex`: copy from the failed check
+- `reject_valid`: true if the rejection is valid (knowledge NOT in history), false if it's a false positive
+- `reason`: brief explanation of your determination

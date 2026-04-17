@@ -1,0 +1,37 @@
+# Oracle Guided V2 Agent — Default Configuration Reference
+#
+# This file is a TEMPLATE — it is never auto-loaded.
+# Copy it and set ORACLE_GUIDED_V2_CONFIG=/path/to/your_copy.yaml
+# Only include keys you want to change; missing keys use Python defaults.
+
+oracle_context:
+  include_golden_patch: false
+  include_golden_test_patch: false
+  include_issue_understanding: false
+  include_react_facts: true
+
+planner:
+  history_near_window: 5      # near interactions: action + observation; older: action only
+  include_system_instruction: false  # include solver system prompt in planner history
+  llm_config: oracle_planner  # config.toml section name
+  json_parse_max_retries: 3
+
+leakage_critic:
+  llm_config: blinded_critic  # config.toml section name
+  json_parse_max_retries: 3
+
+sufficiency_critic:
+  llm_config: blinded_critic  # config.toml section name
+  json_parse_max_retries: 3
+
+agent:
+  num_candidates: 1            # blinded solver candidates per step
+  max_retries: 3               # combined retry budget per step (sufficiency + leakage)
+  oracle_start_step: 0          # oracle activates at this step (0 = always on)
+  oracle_auto_activate: false   # auto-detect Phase 3 header to activate oracle
+  oracle_auto_activate_fallback_step: 10  # activate oracle after this step if Phase 3 not detected
+  finish_extension_steps: 10   # extra steps allowed after all impl done
+
+debug:
+  save_planner_prompts: true
+  save_critic_prompts: true
