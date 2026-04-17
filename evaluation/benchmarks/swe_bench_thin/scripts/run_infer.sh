@@ -3,6 +3,7 @@ set -eo pipefail
 
 source "evaluation/utils/version_control.sh"
 
+# MODEL_CONFIG=${1:-"llm.eval_swebench-verified_gpt-4_1"}
 MODEL_CONFIG=${1:-"llm.eval_glm5_fp8_t0"}
 COMMIT_HASH=${2:-"HEAD"}
 AGENT=${3:-"CodeActAgent"}

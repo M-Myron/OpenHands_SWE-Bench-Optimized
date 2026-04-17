@@ -40,6 +40,15 @@ PS1_SENTINEL = '__THIN_PS1__'  # Used to detect prompt
 DEFAULT_TIMEOUT = 600  # 10 minutes
 NO_CHANGE_TIMEOUT = 30  # seconds with no output change
 
+# Must match openhands/runtime/utils/bash_constants.py:TIMEOUT_MESSAGE_TEMPLATE
+# so agents trained/evaluated against the regular runtime see identical suffixes.
+TIMEOUT_MESSAGE_TEMPLATE = (
+    "You may wait longer to see additional output by sending empty command '', "
+    'send other commands to interact with the current process, '
+    'send keys ("C-c", "C-z", "C-d") to interrupt/kill the previous command before sending your new command, '
+    'or use the timeout parameter in execute_bash for future commands.'
+)
+
 BINARY_EXTENSIONS = frozenset({
     '.pyc', '.pyo', '.so', '.o', '.a', '.lib', '.dll', '.dylib',
     '.exe', '.bin', '.dat', '.db', '.sqlite', '.sqlite3',
@@ -78,7 +87,7 @@ class BashSession:
         env['GIT_PAGER'] = 'cat'
 
         self._process = subprocess.Popen(
-            ['bash', '--norc', '--noprofile', '-i'],
+            ['bash', '--norc', '--noprofile'],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -148,12 +157,21 @@ class BashSession:
         is_input: bool = False,
         blocking: bool = True,
     ):
-        """Execute a command and return (exit_code, output, cwd).
+        """Execute a command and return (exit_code, output, cwd, suffix).
 
-        Uses a unique sentinel marker to detect command completion.
+        ``suffix`` is the trailing bracketed status line appended by the
+        regular runtime's ``CmdOutputMetadata.suffix`` -- matching the exact
+        strings produced by ``openhands/runtime/utils/bash.py`` so agent-facing
+        observations are byte-identical across runtimes. Uses a unique
+        sentinel marker to detect command completion.
         """
         if self._process is None or self._process.poll() is not None:
-            return (-1, 'ERROR: Bash session is no longer running.', self.cwd)
+            return (
+                -1,
+                'ERROR: Bash session is no longer running.',
+                self.cwd,
+                '',
+            )
 
         sentinel = f'{SENTINEL_PREFIX}{uuid.uuid4().hex[:12]}{SENTINEL_SUFFIX}'
 
@@ -175,13 +193,26 @@ class BashSession:
                         pass
                 time.sleep(0.5)
                 output = self._get_output()
-                return (-1, output, self.cwd)
+                # Signal was sent but we can't read its real exit code from an
+                # out-of-band kill; mimic regular runtime which annotates the
+                # CTRL+X suffix. Exit code -1 means "still running / unknown".
+                suffix = (
+                    f'\n[The command completed with exit code -1. '
+                    f'CTRL+{command[-1].upper()} was sent.]'
+                )
+                return (-1, output, self.cwd, suffix)
             else:
                 self._process.stdin.write((command + '\n').encode())
                 self._process.stdin.flush()
                 time.sleep(0.5)
                 output = self._get_output()
-                return (-1, output, self.cwd)
+                # Plain stdin sent to a still-running command. Regular runtime
+                # treats this as "no new output yet"; match that phrasing.
+                suffix = (
+                    f'\n[The command has no new output after {NO_CHANGE_TIMEOUT} seconds. '
+                    f'{TIMEOUT_MESSAGE_TEMPLATE}]'
+                )
+                return (-1, output, self.cwd, suffix)
 
         # Construct the full command with sentinel for completion detection
         # The sentinel echoes exit code and cwd after command completes
@@ -231,15 +262,20 @@ class BashSession:
                 self.cwd = new_cwd
 
                 # Clean up the command output
-                # Remove the sentinel commands that got echoed
-                cmd_output = cmd_output.strip()
+                # Use rstrip only to preserve leading whitespace (matching original bash.py)
+                cmd_output = cmd_output.rstrip()
 
-                return (exit_code, cmd_output, self.cwd)
+                suffix = f'\n[The command completed with exit code {exit_code}.]'
+                return (exit_code, cmd_output, self.cwd, suffix)
 
             # Check timeouts
             if elapsed >= timeout:
-                output = current_output.strip()
-                return (-1, output + '\n[Command timed out]', self.cwd)
+                output = current_output.rstrip()
+                suffix = (
+                    f'\n[The command timed out after {timeout} seconds. '
+                    f'{TIMEOUT_MESSAGE_TEMPLATE}]'
+                )
+                return (-1, output, self.cwd, suffix)
 
             # No-change timeout (for non-blocking commands)
             if not blocking:
@@ -247,8 +283,12 @@ class BashSession:
                     last_change_time = time.time()
                     last_output = current_output
                 elif time.time() - last_change_time > NO_CHANGE_TIMEOUT:
-                    output = current_output.strip()
-                    return (-1, output + '\n[No output change timeout]', self.cwd)
+                    output = current_output.rstrip()
+                    suffix = (
+                        f'\n[The command has no new output after {NO_CHANGE_TIMEOUT} seconds. '
+                        f'{TIMEOUT_MESSAGE_TEMPLATE}]'
+                    )
+                    return (-1, output, self.cwd, suffix)
 
             time.sleep(0.2)
 
@@ -412,37 +452,261 @@ def handle_file_write(path: str, content: str, cwd: str, start: int = 0, end: in
 
     return {
         'observation': 'write',
-        'content': f'File written successfully to {filepath}.',
+        'content': '',
         'extras': {'path': filepath},
     }
+
+
+# Truncation constants matching openhands-aci editor
+_MAX_RESPONSE_LEN_CHAR = 16000
+_TRUNCATE_NOTICE = '<response clipped><NOTE>Due to the max output limit, only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>'
+
+
+def _maybe_truncate(content: str, truncate_after: int = _MAX_RESPONSE_LEN_CHAR) -> str:
+    """Truncate content if it exceeds max length, matching openhands-aci maybe_truncate."""
+    if len(content) <= truncate_after:
+        return content
+    return content[:truncate_after] + _TRUNCATE_NOTICE
+
+
+def _make_output(content: str, description: str, start_line: int = 1) -> str:
+    """Format file content with line numbers, matching openhands-aci _make_output."""
+    content = _maybe_truncate(content)
+    numbered = '\n'.join(
+        f'{i + start_line:6}\t{line}'
+        for i, line in enumerate(content.split('\n'))
+    )
+    return f"Here's the result of running `cat -n` on {description}:\n{numbered}\n"
+
+
+# Snippet context window (lines before/after edit to show)
+_SNIPPET_CONTEXT = 4
+
+
+def _match_and_strip_indent(content: str, old_str: str, new_str: str):
+    """Indent-aware fallback match for str_replace.
+
+    LLMs frequently produce ``old_str`` whose per-line indentation is off by a
+    constant amount (e.g. pasted a class method at module indent). This helper
+    attempts a line-by-line match after removing a common leading-whitespace
+    prefix from ``old_str`` and verifying that every line of the candidate file
+    region shares a single extra indent. If exactly one such region exists in
+    the file, it returns the (start, end, replacement) needed to splice in a
+    correctly-reindented ``new_str``.
+
+    Returns a tuple ``(start_offset, end_offset, replacement_text,
+    replacement_line_no)`` on unique match, else ``None``.
+    """
+    old_lines = old_str.split('\n')
+    non_empty_old = [ln for ln in old_lines if ln.strip()]
+    if not non_empty_old:
+        return None
+
+    def _leading_ws_len(s: str) -> int:
+        return len(s) - len(s.lstrip(' \t'))
+
+    # Dedent old_str by the common leading whitespace of its non-empty lines.
+    min_old_indent = min(_leading_ws_len(ln) for ln in non_empty_old)
+    dedented_old = [
+        (ln[min_old_indent:] if ln.strip() else '') for ln in old_lines
+    ]
+
+    # Split file into lines and precompute start offsets (each line + 1 for \n).
+    file_lines = content.split('\n')
+    offsets = [0]
+    for ln in file_lines:
+        offsets.append(offsets[-1] + len(ln) + 1)
+
+    n = len(dedented_old)
+    if n == 0 or n > len(file_lines):
+        return None
+
+    matches = []
+    for i in range(len(file_lines) - n + 1):
+        indent_prefix = None
+        ok = True
+        for j in range(n):
+            fl = file_lines[i + j]
+            dl = dedented_old[j]
+            if not dl:
+                # Empty (or whitespace-only) old line: file line must also be
+                # empty / whitespace-only to count as a match.
+                if fl.strip() != '':
+                    ok = False
+                    break
+                continue
+            fl_indent_len = _leading_ws_len(fl)
+            fl_indent = fl[:fl_indent_len]
+            fl_rest = fl[fl_indent_len:]
+            if fl_rest != dl:
+                ok = False
+                break
+            if indent_prefix is None:
+                indent_prefix = fl_indent
+            elif fl_indent != indent_prefix:
+                ok = False
+                break
+        if ok and indent_prefix is not None:
+            matches.append((i, indent_prefix))
+
+    if len(matches) != 1:
+        return None
+
+    i, indent_prefix = matches[0]
+    start = offsets[i]
+    last_line_idx = i + n - 1
+    end = offsets[last_line_idx] + len(file_lines[last_line_idx])
+
+    # Reindent new_str: dedent by its own common indent, then prepend
+    # indent_prefix to every non-empty line so the new code aligns with the
+    # existing file block.
+    new_str = new_str or ''
+    new_lines = new_str.split('\n')
+    non_empty_new = [ln for ln in new_lines if ln.strip()]
+    if non_empty_new:
+        min_new_indent = min(_leading_ws_len(ln) for ln in non_empty_new)
+        reindented_new = [
+            (indent_prefix + ln[min_new_indent:]) if ln.strip() else ''
+            for ln in new_lines
+        ]
+    else:
+        reindented_new = new_lines
+    replacement = '\n'.join(reindented_new)
+
+    replacement_line_no = content.count('\n', 0, start) + 1
+    return start, end, replacement, replacement_line_no
 
 
 def handle_file_edit(path: str, cwd: str, command: str,
                      old_str: str = None, new_str: str = None,
                      file_text: str = None, view_range: list = None,
                      insert_line: int = None):
-    """Handle file edit operations (view, str_replace, create, insert, undo_edit)."""
+    """Handle file edit operations (view, str_replace, create, insert, undo_edit).
+    Output format matches openhands-aci exactly."""
     filepath = _resolve_path(path, cwd)
 
     if command == 'view':
-        # Match regular runtime: edit view returns FileEditObservation, not FileReadObservation
-        result = handle_file_read(path, cwd,
-                                start=view_range[0] if view_range else 0,
-                                end=view_range[1] if view_range and len(view_range) > 1 else -1)
-        if result.get('observation') == 'read':
+        # --- Directory view ---
+        if os.path.isdir(filepath):
+            if view_range:
+                return {'observation': 'error',
+                        'content': 'The `view_range` parameter is not allowed when `path` points to a directory.',
+                        'extras': {}}
+            import subprocess as _sp
+            try:
+                # Match openhands_aci.editor.editor.OHEditor.view() exactly:
+                # 1) Count hidden entries at depth 1
+                hidden_proc = _sp.Popen(
+                    rf"find -L {filepath} -mindepth 1 -maxdepth 1 -name '.*'",
+                    shell=True, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                )
+                hidden_stdout, _ = hidden_proc.communicate(timeout=10)
+                hidden_stdout = hidden_stdout.decode('utf-8', errors='replace')
+                hidden_count = (
+                    len(hidden_stdout.strip().split('\n')) if hidden_stdout.strip() else 0
+                )
+
+                # 2) List entries up to 2 levels deep, excluding hidden
+                proc = _sp.Popen(
+                    rf"find -L {filepath} -maxdepth 2 -not \( -path '{filepath}/\.*' -o -path '{filepath}/*/\.*' \) | sort",
+                    shell=True, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                )
+                stdout_b, stderr_b = proc.communicate(timeout=30)
+                stdout = stdout_b.decode('utf-8', errors='replace')
+                stderr = stderr_b.decode('utf-8', errors='replace')
+
+                if stderr:
+                    content = stderr
+                else:
+                    paths = stdout.strip().split('\n') if stdout.strip() else []
+                    formatted_paths = [
+                        (f'{p}/' if os.path.isdir(p) else p) for p in paths
+                    ]
+                    msg = [
+                        f"Here's the files and directories up to 2 levels deep in {filepath}, excluding hidden items:\n"
+                        + '\n'.join(formatted_paths)
+                    ]
+                    if hidden_count > 0:
+                        msg.append(
+                            f"\n{hidden_count} hidden files/directories in this directory are excluded."
+                            f" You can use 'ls -la {filepath}' to see them."
+                        )
+                    content = '\n'.join(msg)
+            except Exception as exc:
+                content = f"Error listing directory: {exc}"
             return {
                 'observation': 'edit',
-                'content': result['content'],
-                'extras': result.get('extras', {}),
+                'content': content,
+                'extras': {'path': filepath, 'impl_source': 'oh_aci'},
             }
-        return result  # error case, pass through
+
+        # --- File view ---
+        if not os.path.exists(filepath):
+            return {'observation': 'error',
+                    'content': f'File not found: {filepath}',
+                    'extras': {}}
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+        except UnicodeDecodeError:
+            return {'observation': 'error',
+                    'content': f'File could not be decoded as utf-8: {filepath}.',
+                    'extras': {}}
+
+        num_lines = len(all_lines)
+        start_line = 1
+        end_line = num_lines
+        warning_message = None
+
+        if view_range and len(view_range) == 2:
+            start_line, end_line = view_range
+
+            if start_line < 1 or start_line > num_lines:
+                return {'observation': 'error',
+                        'content': f'Invalid `view_range` {view_range}: '
+                                   f'Its first element `{start_line}` should be within '
+                                   f'the range of lines of the file: {[1, num_lines]}.',
+                        'extras': {}}
+
+            if end_line == -1:
+                end_line = num_lines
+            elif end_line > num_lines:
+                warning_message = f"NOTE: We only show up to {num_lines} since there're only {num_lines} lines in this file."
+                end_line = num_lines
+
+            if end_line < start_line:
+                return {'observation': 'error',
+                        'content': f'Invalid `view_range` {view_range}: '
+                                   f'Its second element `{end_line}` should be greater than '
+                                   f'or equal to the first element `{start_line}`.',
+                        'extras': {}}
+
+        selected = all_lines[start_line - 1:end_line]
+        file_content = ''.join(selected)
+        # Remove trailing newline for consistent formatting
+        if file_content.endswith('\n'):
+            file_content = file_content[:-1]
+
+        output = _make_output(file_content, filepath, start_line)
+        if warning_message:
+            output = warning_message + '\n' + output
+        return {
+            'observation': 'edit',
+            'content': output,
+            'extras': {'path': filepath, 'impl_source': 'oh_aci'},
+        }
 
     if command == 'create':
         if file_text is None:
             return {'observation': 'error', 'content': 'file_text is required for create', 'extras': {}}
 
-        # Match regular runtime behavior: create returns FileEditObservation, not FileWriteObservation
         filepath_resolved = _resolve_path(path, cwd)
+        if os.path.exists(filepath_resolved):
+            return {'observation': 'error',
+                    'content': f'File already exists at: {filepath_resolved}. Cannot overwrite files using command `create`.',
+                    'extras': {}}
+
         parent = os.path.dirname(filepath_resolved)
         if parent and not os.path.exists(parent):
             os.makedirs(parent)
@@ -476,43 +740,74 @@ def handle_file_edit(path: str, cwd: str, command: str,
         except UnicodeDecodeError:
             return {'observation': 'error', 'content': f'File could not be decoded as utf-8: {filepath}', 'extras': {}}
 
-        count = content.count(old_str)
-        if count == 0:
-            return {
-                'observation': 'error',
-                'content': f'ERROR: No replacement was performed, old_str `{old_str}` did not appear verbatim in {filepath}.',
-                'extras': {},
-            }
-        if count > 1:
-            return {
-                'observation': 'error',
-                'content': f'ERROR: No replacement was performed. Multiple ({count}) occurrences of old_str `{old_str}` in lines of {filepath}. Please ensure it is unique.',
-                'extras': {},
-            }
+        import re as _re
+        pattern = _re.escape(old_str)
+        occurrences = list(_re.finditer(pattern, content))
 
-        new_content = content.replace(old_str, new_str if new_str is not None else '', 1)
+        # Track match region/replacement for both exact and fallback paths.
+        match_start = None
+        match_end = None
+        replacement_line = None
+        new_str_val = new_str if new_str is not None else ''
+
+        if not occurrences:
+            # Fallback 1: indent-aware per-line match (handles LLM off-by-const-indent).
+            indent_match = _match_and_strip_indent(content, old_str, new_str_val)
+            if indent_match is not None:
+                match_start, match_end, new_str_val, replacement_line = indent_match
+            else:
+                # Fallback 2: strip surrounding whitespace (matches openhands-aci).
+                old_str_stripped = old_str.strip()
+                pattern = _re.escape(old_str_stripped)
+                occurrences = list(_re.finditer(pattern, content))
+                if not occurrences:
+                    return {
+                        'observation': 'error',
+                        'content': f'No replacement was performed, old_str `{old_str}` did not appear verbatim in {filepath}.',
+                        'extras': {},
+                    }
+                old_str = old_str_stripped
+                if new_str is not None:
+                    new_str_val = new_str.strip()
+
+        if match_start is None:
+            if len(occurrences) > 1:
+                line_numbers = sorted(set(
+                    content.count('\n', 0, m.start()) + 1 for m in occurrences
+                ))
+                return {
+                    'observation': 'error',
+                    'content': f'No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {line_numbers}. Please ensure it is unique.',
+                    'extras': {},
+                }
+            match = occurrences[0]
+            match_start = match.start()
+            match_end = match.end()
+            replacement_line = content.count('\n', 0, match_start) + 1
+
+        new_content = content[:match_start] + new_str_val + content[match_end:]
 
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(new_content)
 
-        # Compute a simple diff snippet
-        old_lines = old_str.split('\n')
-        new_lines = (new_str if new_str is not None else '').split('\n')
-        diff_parts = []
-        for line in old_lines:
-            diff_parts.append(f'-{line}')
-        for line in new_lines:
-            diff_parts.append(f'+{line}')
-        diff_str = '\n'.join(diff_parts)
+        # Build a snippet around the edit (matching openhands-aci SNIPPET_CONTEXT_WINDOW)
+        snippet_start = max(1, replacement_line - _SNIPPET_CONTEXT)
+        snippet_end = replacement_line + _SNIPPET_CONTEXT + new_str_val.count('\n')
+        new_lines = new_content.split('\n')
+        snippet_end = min(snippet_end, len(new_lines))
+        snippet_content = '\n'.join(new_lines[snippet_start - 1:snippet_end])
+
+        success_msg = f'The file {filepath} has been edited. '
+        success_msg += _make_output(snippet_content, f'a snippet of {filepath}', snippet_start)
+        success_msg += 'Review the changes and make sure they are as expected. Edit the file again if necessary.'
 
         return {
             'observation': 'edit',
-            'content': f'The file {filepath} has been edited. Here\'s the result of running `cat -n` on a snippet of {filepath}:\n{diff_str}\n',
+            'content': success_msg,
             'extras': {
                 'path': filepath,
                 'old_content': content,
                 'new_content': new_content,
-                'diff': diff_str,
                 'impl_source': 'oh_aci',
             },
         }
@@ -528,22 +823,38 @@ def handle_file_edit(path: str, cwd: str, command: str,
 
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+                old_content = f.read()
+                lines = old_content.split('\n')
         except UnicodeDecodeError:
             return {'observation': 'error', 'content': f'File could not be decoded as utf-8: {filepath}', 'extras': {}}
 
         insert_lines_list = new_str.split('\n')
         insert_idx = max(0, min(insert_line, len(lines)))
         for i, line in enumerate(insert_lines_list):
-            lines.insert(insert_idx + i, line + '\n')
+            lines.insert(insert_idx + i, line)
 
+        new_content = '\n'.join(lines)
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+            f.write(new_content)
+
+        # Build snippet around the insertion
+        snippet_start = max(1, insert_idx + 1 - _SNIPPET_CONTEXT)
+        snippet_end = min(len(lines), insert_idx + len(insert_lines_list) + _SNIPPET_CONTEXT)
+        snippet_content = '\n'.join(lines[snippet_start - 1:snippet_end])
+
+        success_msg = f'The file {filepath} has been edited. '
+        success_msg += _make_output(snippet_content, f'a snippet of {filepath}', snippet_start)
+        success_msg += 'Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary.'
 
         return {
             'observation': 'edit',
-            'content': f'The file {filepath} has been edited.',
-            'extras': {'path': filepath},
+            'content': success_msg,
+            'extras': {
+                'path': filepath,
+                'old_content': old_content,
+                'new_content': new_content,
+                'impl_source': 'oh_aci',
+            },
         }
 
     return {'observation': 'error', 'content': f'Unknown edit command: {command}', 'extras': {}}
@@ -566,7 +877,7 @@ def route_action(action_dict: dict, bash_session: BashSession) -> dict:
         if timeout is None:
             timeout = DEFAULT_TIMEOUT
 
-        exit_code, output, cwd = bash_session.execute(
+        exit_code, output, cwd, suffix = bash_session.execute(
             command, timeout=timeout, is_input=is_input, blocking=blocking
         )
 
@@ -575,7 +886,11 @@ def route_action(action_dict: dict, bash_session: BashSession) -> dict:
         if not os.path.exists(py_path):
             py_path = '/usr/bin/python3'
 
-        # Build metadata dict matching CmdOutputMetadata format
+        # Build metadata dict matching CmdOutputMetadata format. The suffix
+        # string is produced inside ``BashSession.execute`` so it mirrors the
+        # regular runtime (openhands/runtime/utils/bash.py) byte-for-byte --
+        # completion, hard timeout, no-change timeout, and CTRL+X-sent signals
+        # all share identical wording.
         metadata = {
             'exit_code': exit_code,
             'pid': -1,
@@ -584,31 +899,15 @@ def route_action(action_dict: dict, bash_session: BashSession) -> dict:
             'working_dir': cwd,
             'py_interpreter_path': py_path,
             'prefix': '',
-            'suffix': f'\n[The command completed with exit code {exit_code}.]'
-            if exit_code != -1
-            else '\n[The command is still running.]',
+            'suffix': suffix,
         }
 
-        # Build suffix content matching the full runtime format
-        suffix_parts = []
-        if exit_code != -1:
-            suffix_parts.append(f'[The command completed with exit code {exit_code}.]')
-        else:
-            suffix_parts.append('[The command is still running.]')
-        suffix_parts.append(f'[Current working directory: {cwd}]')
-        suffix_parts.append(f'[Python interpreter: {py_path}]')
-        if exit_code != -1:
-            suffix_parts.append(f'[Command finished with exit code {exit_code}]')
-        else:
-            suffix_parts.append('[Command is still running in the background]')
-
-        full_suffix = '\n'.join(suffix_parts)
-
-        # Format output to match what ActionExecutionClient expects
+        # NOTE: Do NOT append suffix lines to content.
+        # The regular runtime's to_agent_observation() method
+        # appends [Current working directory: ...], [Python interpreter: ...],
+        # [Command finished with exit code ...] from the metadata fields.
+        # If we also put them in content, they appear TWICE.
         content = output
-        if content and not content.endswith('\n'):
-            content += '\n'
-        content += full_suffix
 
         return {
             'observation': 'run',
@@ -623,6 +922,16 @@ def route_action(action_dict: dict, bash_session: BashSession) -> dict:
     elif action_type == 'read':
         args = action_dict.get('args', {})
         path = args.get('path', '')
+        impl_source = args.get('impl_source', '')
+        view_range = args.get('view_range')
+
+        # OH_ACI read actions (from str_replace_editor view command) need to go
+        # through handle_file_edit to get proper line-numbered output + view_range
+        if impl_source == 'oh_aci' or view_range is not None:
+            return handle_file_edit(
+                path, bash_session.cwd, 'view', view_range=view_range,
+            )
+
         start = args.get('start', 0)
         end = args.get('end', -1)
         return handle_file_read(path, bash_session.cwd, start, end)
