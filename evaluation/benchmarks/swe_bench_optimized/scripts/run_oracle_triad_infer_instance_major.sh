@@ -9,6 +9,8 @@
 #   bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer_instance_major.sh \
 #     <MODEL_CONFIG> <COMMIT_HASH> [AGENT] [EVAL_LIMIT] [MAX_ITER] \
 #     [NUM_WORKERS] [DATASET] [SPLIT] [N_RUNS]
+#
+#    bash evaluation/benchmarks/swe_bench_optimized/scripts/run_oracle_triad_infer_instance_major.sh llm.eval_glm5_fp8_t05 HEAD OracleTriadCodeActAgent 3000 100 32 SWE-Gym/SWE-Gym train 1
 
 set -eo pipefail
 
@@ -81,7 +83,7 @@ if [ -n "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" ] && [ "$OH_RUNTIME_PREPARE_MAX_CO
 fi
 # Guard against stuck relaunches caused by stale env-prepare lock files.
 export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
-export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-1800}
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
 export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
 
 

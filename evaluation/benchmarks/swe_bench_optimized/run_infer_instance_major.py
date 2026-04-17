@@ -148,11 +148,17 @@ def _cleanup_instance_docker_artifacts(
     executed_sids: list[str],
     base_image: str,
     enable_browser: bool,
+    runtime_images: list[str] | None = None,
 ):
-    """Best-effort cleanup after all runs of an instance are done."""
+    """Best-effort cleanup after all runs of an instance are done.
+
+    Only removes the specific containers and images that were actually used
+    by this instance, to avoid interfering with concurrent evaluation jobs.
+    """
     logger.info(
         f'Cleaning docker artifacts for instance {instance_id}. '
-        f'Containers tracked: {len(executed_sids)}'
+        f'Containers tracked: {len(executed_sids)}, '
+        f'Runtime images tracked: {len(runtime_images) if runtime_images else 0}'
     )
 
     # 1) Remove tracked runtime containers for this instance/runs.
@@ -163,53 +169,32 @@ def _cleanup_instance_docker_artifacts(
             f'remove tracked container {container_name}',
         )
 
-    # 2) Remove any containers using this base instance image.
-    _run_cleanup_cmd(
-        [
-            'bash',
-            '-lc',
-            f'docker ps -aq --filter "ancestor={base_image}" | xargs -r docker rm -f',
-        ],
-        f'remove containers by base ancestor {base_image}',
-    )
+    # 2) Remove the specific runtime images that were actually used.
+    # This avoids broad grep/prune patterns that can remove images
+    # needed by other concurrently running instances.
+    removed_images: set[str] = set()
+    if runtime_images:
+        for image in runtime_images:
+            if image and image not in removed_images:
+                _run_cleanup_cmd(
+                    ['docker', 'rmi', '-f', image],
+                    f'remove tracked runtime image {image}',
+                )
+                removed_images.add(image)
 
-    # 3) Remove runtime images associated with this base image.
+    # 3) Remove runtime images derived from this base image (exact tags only).
     for image in _runtime_images_for_base(base_image, enable_browser=enable_browser):
-        _run_cleanup_cmd(
-            ['docker', 'rmi', '-f', image],
-            f'remove runtime image {image}',
-        )
-
-    # 3b) Remove any runtime images whose tag includes this base-image signature.
-    # This catches additional prebuilt tag variants not covered above.
-    simple_tag = base_image.replace('/', '_').replace(':', '_')
-    _run_cleanup_cmd(
-        [
-            'bash',
-            '-lc',
-            (
-                'docker images --format "{{.Repository}}:{{.Tag}}" '
-                f'| grep -F "{simple_tag}" '
-                '| xargs -r docker rmi -f'
-            ),
-        ],
-        f'remove runtime images matching base signature {simple_tag}',
-    )
+        if image not in removed_images:
+            _run_cleanup_cmd(
+                ['docker', 'rmi', '-f', image],
+                f'remove runtime image {image}',
+            )
+            removed_images.add(image)
 
     # 4) Remove instance base image.
     _run_cleanup_cmd(
         ['docker', 'rmi', '-f', base_image],
         f'remove base image {base_image}',
-    )
-
-    # 5) Free dangling image/build cache.
-    _run_cleanup_cmd(
-        ['docker', 'image', 'prune', '-f'],
-        'prune dangling images',
-    )
-    _run_cleanup_cmd(
-        ['docker', 'builder', 'prune', '-f', '--filter', 'until=1h'],
-        'prune old builder cache',
     )
 
 
@@ -219,6 +204,7 @@ def _process_instance_with_sid(
     sid: str,
     reset_logger: bool = True,
     runtime_failure_count: int = 0,
+    runtime_images: list[str] | None = None,
 ) -> EvalOutput:
     """Variant of base.process_instance that uses deterministic sid."""
     if reset_logger:
@@ -301,7 +287,17 @@ def _process_instance_with_sid(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
         )
     finally:
-        runtime.close()
+        # Capture the runtime image name before closing, so cleanup can
+        # target only the specific image used by this run.
+        _runtime_image = getattr(runtime, 'runtime_container_image', None)
+        if _runtime_image and runtime_images is not None:
+            runtime_images.append(_runtime_image)
+        try:
+            runtime.close()
+        except Exception as close_err:
+            logger.warning(
+                f'Non-fatal error closing runtime for {instance.instance_id}: {close_err}'
+            )
 
     test_result = {'git_patch': git_patch}
 
@@ -337,6 +333,7 @@ def _run_single_with_retries(
     max_retries: int,
     timeout_seconds: int | None,
     executed_sids: list[str] | None = None,
+    runtime_images: list[str] | None = None,
 ) -> EvalOutput:
     """Retry wrapper adapted for deterministic sid processing."""
     runtime_failure_count = 0
@@ -354,6 +351,7 @@ def _run_single_with_retries(
                         sid=sid,
                         reset_logger=use_mp,
                         runtime_failure_count=runtime_failure_count,
+                        runtime_images=runtime_images,
                     )
             return _process_instance_with_sid(
                 instance,
@@ -361,6 +359,7 @@ def _run_single_with_retries(
                 sid=sid,
                 reset_logger=use_mp,
                 runtime_failure_count=runtime_failure_count,
+                runtime_images=runtime_images,
             )
         except EvalTimeoutException as e:
             error = f'Timeout after {timeout_seconds} seconds'
@@ -546,6 +545,7 @@ def _process_instance_all_runs(instance_dict: dict[str, Any]) -> dict[str, Any]:
     instance_id = str(instance.instance_id)
 
     executed_sids: list[str] = []
+    runtime_images: list[str] = []
     processed_runs: list[int] = []
     skipped_runs: list[int] = []
 
@@ -585,6 +585,7 @@ def _process_instance_all_runs(instance_dict: dict[str, Any]) -> dict[str, Any]:
             max_retries=_WORKER_MAX_RETRIES,
             timeout_seconds=_WORKER_TIMEOUT_SECONDS,
             executed_sids=executed_sids,
+            runtime_images=runtime_images,
         )
         _append_result(output_file, result, run_id)
         processed_runs.append(run_id)
@@ -625,6 +626,7 @@ def _process_instance_all_runs(instance_dict: dict[str, Any]) -> dict[str, Any]:
             executed_sids=executed_sids,
             base_image=base_image,
             enable_browser=base.RUN_WITH_BROWSING,
+            runtime_images=runtime_images,
         )
 
     return {
@@ -818,7 +820,10 @@ if __name__ == '__main__':
             print(f'### OUTPUT FILE: {run_output_file} ###')
 
         run_instances = prepare_dataset(swe_bench_tests, run_output_file, args.eval_n_limit)
-        pending_ids = set(str(x) for x in run_instances['instance_id'].tolist())
+        if run_instances.empty:
+            pending_ids: set[str] = set()
+        else:
+            pending_ids = set(str(x) for x in run_instances['instance_id'].tolist())
 
         run_context[run_id] = {
             'metadata_json': run_metadata.model_dump_json(),
@@ -858,6 +863,20 @@ if __name__ == '__main__':
     if total_instances_to_process == 0:
         logger.info('No pending instances across all runs. Done.')
         raise SystemExit(0)
+
+    # Use the first run's output dir for env-prepare lock files instead of /tmp.
+    # This scopes locks to this evaluation run, avoids cross-run interference,
+    # and ensures locks are cleaned up when the output dir is removed.
+    if not os.environ.get('OH_RUNTIME_PREPARE_LOCK_DIR'):
+        first_run_id = active_runs[0]
+        lock_dir = os.path.join(
+            run_context[first_run_id]['run_output_dir'], '.env_prepare_locks'
+        )
+        os.makedirs(lock_dir, exist_ok=True)
+        os.environ['OH_RUNTIME_PREPARE_LOCK_DIR'] = lock_dir
+        # No namespace needed since the dir is already run-scoped
+        os.environ.setdefault('OH_RUNTIME_PREPARE_LOCK_NAMESPACE', '.')
+        logger.info(f'Env-prepare lock dir: {lock_dir}')
 
     manager = Manager()
     output_locks = {run_id: manager.Lock() for run_id in active_runs}
@@ -914,15 +933,18 @@ if __name__ == '__main__':
                             f'to see live logs in a separate shell'
                         )
                     elif event.get('type') == 'run_finished':
-                        pbar.update(1)
-                        pbar.set_description(
+                        # Set description/postfix before update to avoid
+                        # multiple tqdm re-renders that cause duplicate lines.
+                        pbar.set_description_str(
                             f"Instance {event.get('instance_id')}"
                         )
                         pbar.set_postfix_str(
                             f"Run {event.get('run_id')}/{n_runs} "
                             f"error={event.get('error')} "
-                            f"Test Result: {event.get('test_result_preview')}"
+                            f"Test Result: {event.get('test_result_preview')}",
+                            refresh=False,
                         )
+                        pbar.update(1)
                         logger.info(
                             f"{event.get('status', 'finished').upper()} evaluation for instance "
                             f"{event.get('instance_id')} (run {event.get('run_id')}): "
@@ -962,13 +984,14 @@ if __name__ == '__main__':
                 except queue.Empty:
                     break
                 if event.get('type') == 'run_finished':
-                    pbar.update(1)
-                    pbar.set_description(f"Instance {event.get('instance_id')}")
+                    pbar.set_description_str(f"Instance {event.get('instance_id')}")
                     pbar.set_postfix_str(
                         f"Run {event.get('run_id')}/{n_runs} "
                         f"error={event.get('error')} "
-                        f"Test Result: {event.get('test_result_preview')}"
+                        f"Test Result: {event.get('test_result_preview')}",
+                        refresh=False,
                     )
+                    pbar.update(1)
                     logger.info(
                         f"{event.get('status', 'finished').upper()} evaluation for instance "
                         f"{event.get('instance_id')} (run {event.get('run_id')}): "

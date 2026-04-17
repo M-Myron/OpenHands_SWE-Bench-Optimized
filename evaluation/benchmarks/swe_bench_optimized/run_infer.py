@@ -948,7 +948,10 @@ def _env_prepare_concurrency_slot():
     stale_lock_seconds = float(
         os.environ.get('OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS', '7200')
     )
-    lock_dir = os.path.join(lock_root, lock_namespace)
+    if lock_namespace == '.':
+        lock_dir = lock_root
+    else:
+        lock_dir = os.path.join(lock_root, lock_namespace)
     os.makedirs(lock_dir, exist_ok=True)
 
     # Eagerly reap any stale locks left by dead processes from a previous run

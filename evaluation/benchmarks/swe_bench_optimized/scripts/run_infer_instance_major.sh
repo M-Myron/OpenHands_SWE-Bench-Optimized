@@ -111,7 +111,10 @@ export OH_RUNTIME_RUNTIME_IMAGE_REPO="docker.io/mmr1115/openhands-runtime"
 
 # Guard against stuck relaunches caused by stale env-prepare lock files.
 export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
-export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-1800}
+# Allow long waits when many workers pull large Docker images concurrently.
+# 1800s (30 min) is too short; large images like astropy/matplotlib can take
+# 5-10 min each, and with 8 slots all occupied that can mean 30+ min waits.
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
 export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
 
 get_openhands_version

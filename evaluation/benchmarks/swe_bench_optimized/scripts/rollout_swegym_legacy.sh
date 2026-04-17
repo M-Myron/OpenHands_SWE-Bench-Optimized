@@ -32,6 +32,7 @@ export ITERATIVE_EVAL_MODE=false
 # Failed instances will be logged to maximum_retries_exceeded.jsonl
 export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 export ITERATIVE_EVAL_MODE=false
+export OH_RUNTIME_RUNTIME_IMAGE_REPO="docker.io/mmr1115/openhands-runtime"
 
 
 echo "=== SWE-Gym Legacy Format Rollout ==="

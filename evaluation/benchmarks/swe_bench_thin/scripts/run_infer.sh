@@ -12,7 +12,7 @@ MAX_ITER=${5:-"100"}
 NUM_WORKERS=${6:-"4"}
 DATASET=${7:-"princeton-nlp/SWE-bench_Verified"}
 SPLIT=${8:-"test"}
-MODE=${9:-"swe"}
+MODE=$9
 EVAL_OUTPUT_DIR=${10:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs_thin"}}
 
 if [ -z "$NUM_WORKERS" ]; then
@@ -51,6 +51,9 @@ export RUNTIME=thin_docker
 # No browsing in thin runtime
 export RUN_WITH_BROWSING=false
 export DEFAULT_RUNTIME_RESOURCE_FACTOR=2
+# Skip instances that reach maximum retries instead of crashing the entire evaluation
+# Failed instances will be logged to maximum_retries_exceeded.jsonl
+export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 
 get_openhands_version
 

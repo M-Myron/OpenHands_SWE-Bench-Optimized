@@ -84,7 +84,12 @@ echo "Running SWE-bench evaluation"
 echo "=============================================================="
 
 RUN_ID=$(date +"%Y%m%d_%H%M%S")
-N_PROCESS=16
+N_PROCESS=${EVAL_MAX_WORKERS:-8}
+
+# Increase Docker client timeout to avoid "Read timed out" errors
+# during concurrent image builds under heavy I/O load.
+export DOCKER_CLIENT_TIMEOUT=${DOCKER_CLIENT_TIMEOUT:-300}
+export COMPOSE_HTTP_TIMEOUT=${COMPOSE_HTTP_TIMEOUT:-300}
 
 
 MODAL_FLAG=""

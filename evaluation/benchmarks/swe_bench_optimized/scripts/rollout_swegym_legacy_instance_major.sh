@@ -13,15 +13,14 @@
 # - Better worker utilization: no idle workers waiting for batch stragglers
 #
 # Usage:
-#   bash evaluation/benchmarks/swe_bench_optimized/scripts/rollout_swegym_legacy_instance_major.sh \
-#       llm.mymodel 'train-legacy-t05' 16 1
+#   bash evaluation/benchmarks/swe_bench_optimized/scripts/rollout_swegym_legacy_instance_major.sh llm.eval_glm5_fp8_t05 'train-glm5_fp8_t05' 16 1
 
 MODEL=$1
 EXP_NAME=$2
 N_WORKERS=${3:-64}
 N_RUNS=${4:-1}
 EVAL_OUTPUT_DIR=${5:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs"}}
-PREPARE_ENV_MAX_WORKERS=${6:-${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-0}}
+PREPARE_ENV_MAX_WORKERS=${6:-${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-8}}
 
 if [ -n "$PREPARE_ENV_MAX_WORKERS" ] && [ "$PREPARE_ENV_MAX_WORKERS" -gt 0 ] 2>/dev/null; then
     export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=$PREPARE_ENV_MAX_WORKERS
@@ -35,8 +34,9 @@ export ITERATIVE_EVAL_MODE=false
 export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 # Guard against stuck relaunches caused by stale env-prepare lock files.
 export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
-export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-1800}
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
 export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
+export OH_RUNTIME_RUNTIME_IMAGE_REPO="docker.io/mmr1115/openhands-runtime"
 
 
 echo "=== SWE-Gym Legacy Format Rollout (Instance-Major) ==="
