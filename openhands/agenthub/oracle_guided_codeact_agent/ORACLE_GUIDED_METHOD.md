@@ -92,24 +92,9 @@ Artifacts have DAG dependencies that enforce a strict phase order:
 facts → reproduce → analysis → plan → edits → validation
 ```
 
-### Phase Gating
-
-The system programmatically enforces that phases cannot be skipped:
-- Cannot create a reproduction script until its dependency facts are unlocked
-- Cannot enter analysis until reproduction is complete
-- Cannot implement code changes until analysis and planning are done
-- Cannot run validation until all edits are applied
-
-This is enforced by detecting **tool actions** (not keywords) in the oracle's output:
-- File creation → gates reproduction phase
-- Code modification (`str_replace`, `sed -i`) → gates implementation phase
-- Phase headers (`## Phase 5:`, `## Phase 6:`) → gates corresponding phase
 
 ## What Makes This Different
 
-### vs. Standard Distillation (strong → weak)
-- **Standard**: Teacher generates entire trajectory. Student learns to imitate.
-- **Ours**: Student generates candidates. Oracle selects/corrects. Student's own distribution shapes the trajectory, with oracle providing minimal corrections. This reduces distribution shift between training and inference.
 
 ### vs. Rejection Sampling
 - **Rejection sampling**: Generate 100 trajectories, keep the 2 that pass tests. Requires solving the problem independently. Very low yield on hard tasks.
@@ -133,7 +118,7 @@ Our solution uses multiple enforcement layers:
 
 Fact graphs are pre-computed from the ground-truth patch using a two-stage pipeline:
 
-**Stage 1**: An analysis LLM reads the issue + patch and produces a structured investigation plan — what facts would a developer need to discover, in what order, and what actions would reveal them.
+**Stage 1**: An analysis LLM reads the issue + patch and produces a structured investigation plan — what facts would a developer need to discover, in what order, and what actions would reveal them. what preconditional knowledge and fact one should known so that can make this implementation patch reachable.
 
 **Stage 2**: A refinement LLM validates the graph, adds precise unlocker actions (exact file paths, line ranges, runnable test code), and ensures the DAG dependencies are correct.
 
