@@ -275,6 +275,15 @@ enable_history_truncation = true
 # Whether the condensation request tool is enabled
 enable_condensation_request = false
 
+# Whether to merge reasoning_content into content for assistant messages in
+# conversation history. For reasoning models (e.g. GLM-5 with --reasoning-parser
+# glm45, DeepSeek-R1, Qwen3 with enable_thinking) that split thinking into a
+# separate reasoning_content field, enabling this preserves the model's chain of
+# thought across turns. Default is false (standard OpenAI API convention where
+# reasoning is ephemeral and not included in history).
+# This setting applies to both interactive and evaluation runs.
+#enable_reasoning_in_history = false
+
 [agent.RepoExplorerAgent]
 # Example: use a cheaper model for RepoExplorerAgent to reduce cost, especially
 # useful when an agent doesn't demand high quality but uses a lot of tokens

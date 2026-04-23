@@ -345,6 +345,9 @@ def get_config(
         system_prompt_filename=metadata.agent_config.system_prompt_filename
         if metadata.agent_config
         else 'system_prompt.j2',
+        enable_reasoning_in_history=metadata.agent_config.enable_reasoning_in_history
+        if metadata.agent_config
+        else False,
     )
     config.set_agent_config(agent_config)
 

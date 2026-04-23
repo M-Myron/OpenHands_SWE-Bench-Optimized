@@ -71,7 +71,9 @@ def set_security_risk(action: Action, arguments: dict) -> None:
 
 
 def response_to_actions(
-    response: ModelResponse, mcp_tool_names: list[str] | None = None
+    response: ModelResponse,
+    mcp_tool_names: list[str] | None = None,
+    include_reasoning_in_thought: bool = True,
 ) -> list[Action]:
     actions: list[Action] = []
     assert len(response.choices) == 1, 'Only one choice is supported for now'
@@ -80,12 +82,17 @@ def response_to_actions(
     if hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls:
         # Check if there's assistant_msg.content. If so, add it to the thought
         thought = ''
+        # Optionally include reasoning_content (from reasoning models like GLM-5) in thought
+        if include_reasoning_in_thought and hasattr(assistant_msg, 'reasoning_content') and assistant_msg.reasoning_content:
+            thought = assistant_msg.reasoning_content
         if isinstance(assistant_msg.content, str):
-            thought = assistant_msg.content
+            thought = (thought + '\n\n' + assistant_msg.content).strip() if thought else assistant_msg.content
         elif isinstance(assistant_msg.content, list):
+            text_content = ''
             for msg in assistant_msg.content:
                 if msg['type'] == 'text':
-                    thought += msg['text']
+                    text_content += msg['text']
+            thought = (thought + '\n\n' + text_content).strip() if thought else text_content
 
         # Process each tool call to OpenHands action
         for i, tool_call in enumerate(assistant_msg.tool_calls):

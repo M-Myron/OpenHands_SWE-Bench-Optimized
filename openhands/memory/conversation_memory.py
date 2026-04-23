@@ -259,13 +259,22 @@ class ConversationMemory:
             llm_response: ModelResponse = tool_metadata.model_response
             assistant_msg = getattr(llm_response.choices[0], 'message')
 
+            # Determine effective content for the assistant message
+            effective_content = assistant_msg.content or ''
+            # Optionally merge reasoning_content into content so the model
+            # can see its prior reasoning in subsequent turns
+            if self.agent_config.enable_reasoning_in_history:
+                reasoning_content = getattr(assistant_msg, 'reasoning_content', None)
+                if reasoning_content:
+                    effective_content = (reasoning_content + '\n\n' + effective_content).strip()
+
             # Add the LLM message (assistant) that initiated the tool calls
             # (overwrites any previous message with the same response_id)
             pending_tool_call_action_messages[llm_response.id] = Message(
                 role=getattr(assistant_msg, 'role', 'assistant'),
                 # tool call content SHOULD BE a string
-                content=[TextContent(text=assistant_msg.content)]
-                if assistant_msg.content and assistant_msg.content.strip()
+                content=[TextContent(text=effective_content)]
+                if effective_content and effective_content.strip()
                 else [],
                 tool_calls=assistant_msg.tool_calls,
             )

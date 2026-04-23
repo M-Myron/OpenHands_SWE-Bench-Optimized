@@ -49,6 +49,11 @@ class AgentConfig(BaseModel):
     """Whether history should be truncated to continue the session when hitting LLM context length limit."""
     enable_som_visual_browsing: bool = Field(default=True)
     """Whether to enable SoM (Set of Marks) visual browsing."""
+    enable_reasoning_in_history: bool = Field(default=False)
+    """Whether to merge reasoning_content into content for assistant messages in conversation history.
+    For reasoning models (e.g. GLM-5 with glm45 parser) that split thinking into a separate
+    reasoning_content field, enabling this preserves the model's chain of thought across turns.
+    Default is False to follow the standard OpenAI API convention where reasoning is ephemeral."""
     enable_plan_mode: bool = Field(default=True)
     """Whether to enable plan mode, which uses the long horizon system message and add the new tool - task_tracker - for planning, tracking and executing complex tasks."""
     condenser: CondenserConfig = Field(

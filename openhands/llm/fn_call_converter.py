@@ -479,8 +479,15 @@ def convert_fncall_messages_to_non_fncall_messages(
     messages: list[dict],
     tools: list[ChatCompletionToolParam],
     add_in_context_learning_example: bool = True,
+    merge_reasoning_content: bool = True,
 ) -> list[dict]:
-    """Convert function calling messages to non-function calling messages."""
+    """Convert function calling messages to non-function calling messages.
+
+    Args:
+        merge_reasoning_content: If True, merge 'reasoning_content' field into
+            'content' for assistant messages. Useful for reasoning models (e.g.
+            GLM-5 with glm45 parser) that split thinking into a separate field.
+    """
     messages = copy.deepcopy(messages)
 
     formatted_tools = convert_tools_to_description(tools)
@@ -493,6 +500,18 @@ def convert_fncall_messages_to_non_fncall_messages(
     for message in messages:
         role = message['role']
         content = message['content']
+
+        # Optionally merge reasoning_content into content for reasoning models
+        # (e.g. GLM-5) so that the thinking process is preserved in the SFT data
+        if merge_reasoning_content:
+            reasoning_content = message.get('reasoning_content')
+            if reasoning_content and role == 'assistant':
+                if isinstance(content, str):
+                    content = (reasoning_content + '\n\n' + content).strip()
+                elif isinstance(content, list):
+                    content.insert(0, {'type': 'text', 'text': reasoning_content})
+                elif not content:
+                    content = reasoning_content
 
         # 1. SYSTEM MESSAGES
         # append system prompt suffix to content
