@@ -17,6 +17,7 @@ INSTANCE_ID=$2
 DATASET_NAME=${3:-"princeton-nlp/SWE-bench_Lite"}
 SPLIT=${4:-"test"}
 ENVIRONMENT=${5:-"local"}
+export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 
 echo "INSTANCE_ID: $INSTANCE_ID"
 echo "DATASET_NAME: $DATASET_NAME"

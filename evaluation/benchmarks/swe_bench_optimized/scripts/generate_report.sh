@@ -12,6 +12,8 @@
 # This reads all per-instance report.json files inside <output_dir>/eval_outputs/
 # and produces an aggregated report.json in <output_dir>/report.json.
 # It also regenerates the README.md summary.
+# ./evaluation/benchmarks/swe_bench_optimized/scripts/generate_report.sh /home/v-murongma/code/OpenHands_SWE-Bench-Optimized/evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/CodeActAgent/policy_traj_128k_swegym_all_2092i_qwen2.5_coder_32b_full_128k_megatron_20260416_113234_maxiter_100_N_v0.61.0-no-hint "princeton-nlp/SWE-bench_Verified" "test"
+
 
 set -euo pipefail
 
@@ -55,6 +57,7 @@ fi
 # ------------------------------------------------------------------
 # Generate report from eval_outputs
 # ------------------------------------------------------------------
+export OUTPUT_DIR PREDICTIONS_FILE DATASET_NAME SPLIT
 python3 << 'PYEOF'
 import json
 import glob

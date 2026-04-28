@@ -731,6 +731,14 @@ def handle_file_edit(path: str, cwd: str, command: str,
         if old_str is None:
             return {'observation': 'error', 'content': 'old_str is required for str_replace', 'extras': {}}
 
+        _new_str_cmp = new_str if new_str is not None else ''
+        if old_str == _new_str_cmp:
+            return {
+                'observation': 'error',
+                'content': 'No replacement was performed. `new_str` and `old_str` must be different.',
+                'extras': {},
+            }
+
         if not os.path.exists(filepath):
             return {'observation': 'error', 'content': f'File not found: {filepath}', 'extras': {}}
 

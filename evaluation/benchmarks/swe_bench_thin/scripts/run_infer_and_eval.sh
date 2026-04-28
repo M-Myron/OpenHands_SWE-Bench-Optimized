@@ -6,6 +6,7 @@ set -eo pipefail
 # Usage:
 #   ./run_infer_and_eval.sh <MODEL_CONFIG> <COMMIT_HASH> <AGENT> <EVAL_LIMIT> \
 #       <MAX_ITER> <NUM_WORKERS> <DATASET> <SPLIT> [MODE]
+#   ./evaluation/benchmarks/swe_bench_thin/scripts/run_infer_and_eval.sh llm.eval_policy_traj_128k_swegym_all_2092i_qwen2-5_coder_32b_full_128k_megatron HEAD CodeActAgent 500 100 16 princeton-nlp/SWE-bench_Verified test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

@@ -168,6 +168,66 @@ def _paths_match(path_a: str, path_b: str) -> bool:
     return bool(suffixes_a & suffixes_b)
 
 
+def _exploratory_path_reachable(
+    filepath: str,
+    known_files: set[str],
+    issue_text: str,
+    memory: 'StructuredHistoryMemory',
+) -> bool:
+    """Check if an exploratory-action file path is inferrable from known context.
+
+    Exploratory actions (view/read/grep) discover new information, so they
+    don't need the exact file to appear in history. However, the path must
+    still be *reachable* — otherwise oracle-leaked paths to unknown
+    directories get a blanket free pass through B1.
+
+    Returns True if at least one of:
+      1. The file (or a meaningful suffix) appears in the issue text.
+      2. A sibling/cousin file in the same directory was previously accessed
+         (parent directory is known from history).
+      3. The file's module name (basename sans extension) appears in history
+         text — e.g., visible in import statements.
+    """
+    import os
+
+    # 1. Issue text mentions this path or a meaningful suffix.
+    if _path_in_text(filepath, issue_text):
+        return True
+
+    # 2. Parent directory known — a sibling or deeper file was accessed.
+    parent = os.path.dirname(filepath.rstrip('/'))
+    if parent:
+        # Require at least 2 components so we don't match on just "moto/"
+        parent_suffixes = set(
+            s.lower() for s in _path_suffixes(parent) if '/' in s
+        )
+        for kf in known_files:
+            kf_dir = os.path.dirname(kf.rstrip('/'))
+            if not kf_dir:
+                continue
+            kf_dir_suffixes = set(
+                s.lower() for s in _path_suffixes(kf_dir) if '/' in s
+            )
+            # Same directory
+            if parent_suffixes & kf_dir_suffixes:
+                return True
+            # Known file is in a subdirectory of our target's parent
+            for ps in parent_suffixes:
+                for kds in kf_dir_suffixes:
+                    if kds.startswith(ps + '/'):
+                        return True
+
+    # 3. Module name appears in history text (e.g., import statements).
+    basename = os.path.basename(filepath)
+    module_name = os.path.splitext(basename)[0] if basename else ''
+    if module_name and len(module_name) > 3:  # skip short generic names
+        for u in memory.units:
+            if module_name.lower() in u.full_text.lower():
+                return True
+
+    return False
+
+
 class SymbolicRuleEngine:
     """Evaluate deterministic verification rules over claims and evidence.
 
@@ -520,14 +580,17 @@ class SymbolicRuleEngine:
     ) -> RuleResult:
         """B1: Every proposed file path must be justified (issue, history, or search).
 
-        Exempt: file paths from exploratory action claims (read/view/grep/find)
-        since the action itself IS the discovery step.
+        Exploratory action claims (read/view/grep/find) get a *relaxed* check:
+        the exact file need not have been listed, but the path must be
+        inferrable from known context (parent directory seen, imports visible,
+        or mentioned in the issue).  This prevents oracle-leaked paths in
+        unknown directories from getting a blanket free pass.
         """
         known_files = self.memory.get_all_known_files()
         unjustified: list[str] = []
         evidence_ids: list[int] = []
 
-        # Collect paths that are from exploratory claims (exempt from justification)
+        # Collect paths that are from exploratory claims (relaxed check)
         exploratory_paths: set[str] = set()
         for c in claims:
             if c.claim_type in ('action', 'localization') and _EXPLORATORY_ACTION_RE.search(c.text):
@@ -538,10 +601,14 @@ class SymbolicRuleEngine:
             all_paths.update(c.file_paths)
 
         for fp in all_paths:
-            # Exploratory actions don't need prior file path provenance —
-            # reading/searching IS how you discover a file.
+            # Exploratory actions get a relaxed check — they don't need the
+            # exact file to be listed, but the path must be inferrable from
+            # known context (parent directory seen, imports, or issue text).
             if fp in exploratory_paths:
-                continue
+                if _exploratory_path_reachable(fp, known_files, self.issue_text, self.memory):
+                    continue
+                # Not inferrable — fall through to regular justification
+                # checks below; if those also fail, the path is unjustified.
             # Check issue text (with path normalization for cross-prefix matching)
             if _path_in_text(fp, self.issue_text):
                 continue
