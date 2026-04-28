@@ -229,6 +229,9 @@ class ThinDockerRuntime(Runtime):
         if self.base_container_image is None:
             raise ValueError('base_container_image is not set')
 
+        # Ensure the image is available locally (pull if needed)
+        self._ensure_image_available(self.base_container_image)
+
         # Start container with sleep infinity (keep it alive)
         try:
             self.container = self.docker_client.containers.run(
@@ -254,8 +257,19 @@ class ThinDockerRuntime(Runtime):
         # Find a working Python in the container
         python_path = self._find_python_in_container()
 
+        # Copy the Python binary to a hidden name so that agent commands like
+        # `killall python` or `killall -9 python3` won't kill the executor.
+        # `killall` matches on /proc/PID/comm which is the binary basename.
+        hidden_python = '/tmp/.thin_exec_py'
+        exit_code, _ = self.container.exec_run(
+            ['bash', '-c', f'cp {python_path} {hidden_python} && chmod +x {hidden_python}'],
+        )
+        if exit_code != 0:
+            self.log('warning', f'[ThinDocker] Failed to copy python to {hidden_python}, using original')
+            hidden_python = python_path
+
         # Start the thin executor server inside the container
-        exec_cmd = f'{python_path} /tmp/thin_executor.py {self._container_port} --working-dir /workspace'
+        exec_cmd = f'{hidden_python} /tmp/thin_executor.py {self._container_port} --working-dir /workspace'
         self.log('info', f'[ThinDocker] Starting thin executor: {exec_cmd}')
 
         # Use docker exec in detached mode
@@ -290,6 +304,41 @@ class ThinDockerRuntime(Runtime):
 
         raise RuntimeError(
             'Could not find a working Python interpreter in the container'
+        )
+
+    def _ensure_image_available(self, image: str) -> None:
+        """Ensure a Docker image is available locally, pulling if needed.
+
+        The Docker SDK's containers.run() auto-pull can fail silently under
+        rate limits or network issues, then report a confusing 404 on inspect.
+        This method does an explicit pull with retries when the image is missing.
+        """
+        try:
+            self.docker_client.images.get(image)
+            self.log('debug', f'[ThinDocker] Image already available locally: {image}')
+            return
+        except docker.errors.ImageNotFound:
+            pass
+
+        self.log('info', f'[ThinDocker] Pulling image: {image}')
+        max_retries = 3
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.docker_client.images.pull(image, platform=self.config.sandbox.platform or 'linux/amd64')
+                self.log('info', f'[ThinDocker] Successfully pulled image: {image}')
+                return
+            except Exception as e:
+                last_err = e
+                self.log(
+                    'warning',
+                    f'[ThinDocker] Pull attempt {attempt}/{max_retries} failed for {image}: {e}',
+                )
+                if attempt < max_retries:
+                    time.sleep(5 * attempt)
+
+        raise docker.errors.ImageNotFound(
+            f'Failed to pull image {image} after {max_retries} attempts: {last_err}'
         )
 
     def _copy_file_to_container(self, host_path: str, container_path: str) -> None:
@@ -544,10 +593,21 @@ class ThinDockerRuntime(Runtime):
 
         port, port_lock = result
 
-        # Check if Docker is using this port
-        containers = self.docker_client.containers.list()
-        for c in containers:
-            if str(port) in str(c.ports):
+        # Check if Docker is using this port.
+        # Use the low-level API to avoid the TOCTOU race in the SDK's
+        # containers.list() which can fail with NotFound when a container
+        # is removed between listing and inspecting.
+        try:
+            raw_containers = self.docker_client.api.containers()
+        except Exception:
+            raw_containers = []
+        for c in raw_containers:
+            ports = c.get('Ports', [])
+            if any(
+                p.get('PublicPort') == port or p.get('PrivatePort') == port
+                for p in ports
+                if isinstance(p, dict)
+            ):
                 port_lock.release()
                 return self._find_available_port_with_lock(port_range, max_attempts - 1)
 
@@ -572,10 +632,20 @@ class ThinDockerRuntime(Runtime):
         if self.config.sandbox.keep_runtime_alive or self.attach_to_existing:
             return
 
-        close_prefix = (
-            CONTAINER_NAME_PREFIX if rm_all_containers else self.container_name
-        )
-        stop_all_containers(close_prefix)
+        if rm_all_containers:
+            # Bulk cleanup: stop all containers with the thin prefix
+            stop_all_containers(CONTAINER_NAME_PREFIX)
+        else:
+            # Normal path: only stop/remove this specific container.
+            # Avoids listing all containers which overloads the Docker daemon
+            # when running with many concurrent workers.
+            try:
+                if self.container is not None:
+                    self.container.stop(timeout=10)
+                    self.container.remove(force=True)
+            except Exception:
+                # Container may already be gone — that's fine
+                pass
         self._release_port_locks()
 
     @property

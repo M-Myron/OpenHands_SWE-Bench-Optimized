@@ -20,6 +20,11 @@ NUM_WORKERS=${6:-4}
 DATASET=${7:-SWE-Gym/SWE-Gym}
 SPLIT=${8:-train}
 N_RUNS=${9:-1}
+PREPARE_ENV_MAX_WORKERS=${10:-${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-8}}
+
+if [ -n "$PREPARE_ENV_MAX_WORKERS" ] && [ "$PREPARE_ENV_MAX_WORKERS" -gt 0 ] 2>/dev/null; then
+    export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=$PREPARE_ENV_MAX_WORKERS
+fi
 
 checkout_eval_branch
 
@@ -28,6 +33,11 @@ export RUNTIME=thin_docker
 export RUN_WITH_BROWSING=false
 export DEFAULT_RUNTIME_RESOURCE_FACTOR=2
 export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
+
+# Guard against stuck relaunches caused by stale env-prepare lock files.
+export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
+export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
 
 # ---------------------------------------------------------------------------
 # Guided agent env vars (same as optimized version)
@@ -75,6 +85,11 @@ echo "  MAX_ITER:                 $MAX_ITER"
 echo "  NUM_WORKERS:              $NUM_WORKERS"
 echo "  N_RUNS:                   $N_RUNS"
 echo "  RUNTIME:                  thin_docker"
+if [ -n "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" ] && [ "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" -gt 0 ] 2>/dev/null; then
+    echo "  PREPARE_CONCURRENCY:      $OH_RUNTIME_PREPARE_MAX_CONCURRENCY"
+else
+    echo "  PREPARE_CONCURRENCY:      disabled"
+fi
 echo "  ORACLE_PREPROCESS_DIR:    ${ORACLE_PREPROCESS_DIR:-(not set)}"
 echo "  ORACLE_GUIDED_CONFIG:     ${ORACLE_GUIDED_CONFIG:-(not set)}"
 echo "  EVAL_NOTE:                $EVAL_NOTE"

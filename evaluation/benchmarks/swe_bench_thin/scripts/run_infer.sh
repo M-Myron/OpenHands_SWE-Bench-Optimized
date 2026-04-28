@@ -14,6 +14,11 @@ DATASET=${7:-"princeton-nlp/SWE-bench_Verified"}
 SPLIT=${8:-"test"}
 MODE=$9
 EVAL_OUTPUT_DIR=${10:-${EVAL_OUTPUT_DIR:-"evaluation/evaluation_outputs/outputs_thin"}}
+PREPARE_ENV_MAX_WORKERS=${11:-${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-8}}
+
+if [ -n "$PREPARE_ENV_MAX_WORKERS" ] && [ "$PREPARE_ENV_MAX_WORKERS" -gt 0 ] 2>/dev/null; then
+    export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=$PREPARE_ENV_MAX_WORKERS
+fi
 
 if [ -z "$NUM_WORKERS" ]; then
   NUM_WORKERS=1
@@ -55,6 +60,11 @@ export DEFAULT_RUNTIME_RESOURCE_FACTOR=2
 # Failed instances will be logged to maximum_retries_exceeded.jsonl
 export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 
+# Guard against stuck relaunches caused by stale env-prepare lock files.
+export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
+export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
+
 get_openhands_version
 
 echo "======================================"
@@ -71,6 +81,11 @@ echo "COMMIT_HASH: $COMMIT_HASH"
 echo "MODE: $MODE"
 echo "RUNTIME: thin_docker"
 echo "EVAL_OUTPUT_DIR: $EVAL_OUTPUT_DIR"
+if [ -n "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" ] && [ "$OH_RUNTIME_PREPARE_MAX_CONCURRENCY" -gt 0 ] 2>/dev/null; then
+    echo "OH_RUNTIME_PREPARE_MAX_CONCURRENCY: $OH_RUNTIME_PREPARE_MAX_CONCURRENCY"
+else
+    echo "OH_RUNTIME_PREPARE_MAX_CONCURRENCY: disabled"
+fi
 echo "======================================"
 
 # Default to NOT use Hint

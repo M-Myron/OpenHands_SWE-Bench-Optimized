@@ -1,12 +1,16 @@
 import copy
+import errno
 import json
 import os
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable
+
+import docker as docker_lib
 
 import pandas as pd
 from tqdm import tqdm
@@ -38,6 +42,263 @@ from openhands.utils.async_utils import call_async_from_sync
 # TODO: migrate all swe-bench docker to ghcr.io/openhands
 DOCKER_IMAGE_PREFIX = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/')
 logger.info(f'Using docker image prefix: {DOCKER_IMAGE_PREFIX}')
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_lock_owner_pid(lock_file: str) -> int | None:
+    try:
+        with open(lock_file, 'r') as f:
+            content = f.read().strip()
+    except OSError:
+        return None
+    if not content:
+        return None
+    try:
+        return int(content)
+    except ValueError:
+        return None
+
+
+def _try_reap_stale_prepare_slot(
+    lock_file: str,
+    stale_seconds: float,
+    lock_namespace: str,
+) -> bool:
+    try:
+        stat = os.stat(lock_file)
+    except (FileNotFoundError, OSError):
+        return False
+
+    owner_pid = _read_lock_owner_pid(lock_file)
+    if owner_pid is not None:
+        if _is_pid_alive(owner_pid):
+            return False
+    else:
+        if stale_seconds <= 0:
+            return False
+        age = time.time() - stat.st_mtime
+        if age < stale_seconds:
+            return False
+
+    age = time.time() - stat.st_mtime
+    try:
+        os.remove(lock_file)
+    except (FileNotFoundError, OSError):
+        return False
+
+    logger.warning(
+        'Removed stale env-prepare slot lock: %s (age=%.1fs, owner_pid=%s, namespace=%s)',
+        lock_file, age, owner_pid, lock_namespace,
+    )
+    return True
+
+
+@contextmanager
+def _env_prepare_concurrency_slot():
+    """Limit concurrent runtime environment preparation across worker processes.
+
+    Controlled via OH_RUNTIME_PREPARE_MAX_CONCURRENCY.
+    - Missing/0/negative: no throttling
+    - Positive integer: at most N workers can prepare runtime env at once
+    """
+    raw_limit = os.environ.get('OH_RUNTIME_PREPARE_MAX_CONCURRENCY', '').strip()
+    if not raw_limit:
+        yield
+        return
+
+    try:
+        max_slots = int(raw_limit)
+    except ValueError:
+        logger.warning(
+            f'Invalid OH_RUNTIME_PREPARE_MAX_CONCURRENCY={raw_limit!r}; disabling env-prepare throttle.'
+        )
+        yield
+        return
+
+    if max_slots <= 0:
+        yield
+        return
+
+    lock_root = os.environ.get(
+        'OH_RUNTIME_PREPARE_LOCK_DIR', '/tmp/openhands_runtime_prepare_slots'
+    )
+    lock_namespace = os.environ.get('OH_RUNTIME_PREPARE_LOCK_NAMESPACE', 'default')
+    wait_log_seconds = float(
+        os.environ.get('OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS', '30')
+    )
+    timeout_seconds = float(
+        os.environ.get('OH_RUNTIME_PREPARE_TIMEOUT_SECONDS', '0')
+    )
+    stale_lock_seconds = float(
+        os.environ.get('OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS', '7200')
+    )
+    if lock_namespace == '.':
+        lock_dir = lock_root
+    else:
+        lock_dir = os.path.join(lock_root, lock_namespace)
+    os.makedirs(lock_dir, exist_ok=True)
+
+    for fname in os.listdir(lock_dir):
+        if fname.endswith('.lock'):
+            _try_reap_stale_prepare_slot(
+                os.path.join(lock_dir, fname),
+                stale_seconds=stale_lock_seconds,
+                lock_namespace=lock_namespace,
+            )
+
+    slot_path = None
+    pid = os.getpid()
+    start_wait = time.time()
+    last_wait_log = start_wait
+    wait_log_count = 0
+
+    while slot_path is None:
+        for slot_idx in range(max_slots):
+            candidate = os.path.join(lock_dir, f'slot_{slot_idx}.lock')
+            try:
+                fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, 'w') as f:
+                    f.write(str(pid))
+                slot_path = candidate
+                break
+            except FileExistsError:
+                _try_reap_stale_prepare_slot(
+                    candidate,
+                    stale_seconds=stale_lock_seconds,
+                    lock_namespace=lock_namespace,
+                )
+                continue
+            except OSError as e:
+                if e.errno == errno.EMFILE:
+                    logger.warning(
+                        'EMFILE while acquiring env-prepare slot (pid=%s, namespace=%s); sleeping before retry.',
+                        pid, lock_namespace,
+                    )
+                    time.sleep(1.0)
+                    continue
+                raise
+
+        if slot_path is None:
+            now = time.time()
+            waited = now - start_wait
+            if timeout_seconds > 0 and waited >= timeout_seconds:
+                raise TimeoutError(
+                    'Timed out after '
+                    f'{waited:.1f}s waiting for env-prepare slot '
+                    f'(limit={max_slots}, namespace={lock_namespace}). '
+                    'If this happens after a crash/relaunch, try cleaning stale lock files '
+                    f'under {lock_dir}.'
+                )
+
+            if wait_log_seconds > 0 and now - last_wait_log >= wait_log_seconds:
+                active_locks = len([f for f in os.listdir(lock_dir) if f.endswith('.lock')])
+                logger.warning(
+                    'Waiting for env-prepare slot for %.1fs '
+                    '(limit=%s, pid=%s, namespace=%s, active_locks=%s).',
+                    waited, max_slots, pid, lock_namespace, active_locks,
+                )
+                last_wait_log = now
+                wait_log_count += 1
+                wait_log_seconds = min(wait_log_seconds * 2, 300)
+
+            time.sleep(0.5)
+
+    waited_seconds = time.time() - start_wait
+    if waited_seconds >= 1:
+        logger.info(
+            f'Acquired env-prepare slot after waiting {waited_seconds:.1f}s '
+            f'(limit={max_slots}, pid={pid}, slot={os.path.basename(slot_path)}).'
+        )
+
+    try:
+        yield
+    finally:
+        if slot_path:
+            try:
+                os.remove(slot_path)
+            except FileNotFoundError:
+                pass
+
+
+ENABLE_EVAL_IMAGE_CLEANUP = os.environ.get('EVAL_CLEANUP_IMAGES', 'true').lower() in ('true', '1', 'yes')
+
+
+def _remove_single_image(client, image_name: str, instance_id: str) -> bool:
+    """Remove a single Docker image if no container references it. Returns True if removed."""
+    try:
+        containers = client.containers.list(all=True, filters={'ancestor': image_name})
+        if containers:
+            logger.debug(
+                f'[{instance_id}] Skipping image cleanup for {image_name}: '
+                f'{len(containers)} container(s) still reference it'
+            )
+            return False
+
+        client.images.remove(image_name, force=False, noprune=False)
+        logger.info(f'[{instance_id}] Removed Docker image: {image_name}')
+        return True
+    except docker_lib.errors.ImageNotFound:
+        return False
+    except docker_lib.errors.APIError as e:
+        if 'conflict' in str(e).lower() or 'is being used' in str(e).lower():
+            logger.debug(
+                f'[{instance_id}] Image {image_name} still in use, skipping cleanup'
+            )
+        else:
+            logger.warning(
+                f'[{instance_id}] Failed to remove image {image_name}: {e}'
+            )
+        return False
+
+
+def _cleanup_runtime_image(runtime, instance_id: str) -> None:
+    """Remove the Docker image(s) used by this eval instance after the container is closed.
+
+    Handles both ThinDockerRuntime (base_container_image only) and
+    DockerRuntime (runtime_container_image overlay + base_container_image).
+    Safe to call concurrently: skips images still referenced by any container.
+    """
+    if not ENABLE_EVAL_IMAGE_CLEANUP:
+        return
+
+    try:
+        client = docker_lib.from_env()
+    except Exception as e:
+        logger.warning(f'[{instance_id}] Cannot connect to Docker for image cleanup: {e}')
+        return
+
+    # DockerRuntime builds an overlay image (runtime_container_image) on top of
+    # base_container_image. Remove the overlay first, then the base.
+    # ThinDockerRuntime only has base_container_image (no overlay).
+    runtime_image = getattr(runtime, 'runtime_container_image', None)
+    base_image = getattr(runtime, 'base_container_image', None)
+
+    if runtime_image:
+        _remove_single_image(client, runtime_image, instance_id)
+    if base_image and base_image != runtime_image:
+        _remove_single_image(client, base_image, instance_id)
+
+    # Prune dangling images (untagged layers left after removal)
+    try:
+        pruned = client.images.prune(filters={'dangling': True})
+        reclaimed = pruned.get('SpaceReclaimed', 0)
+        if reclaimed > 0:
+            logger.info(
+                f'[{instance_id}] Pruned dangling images, reclaimed {reclaimed / (1024**2):.1f} MB'
+            )
+    except Exception as e:
+        logger.debug(f'[{instance_id}] Dangling image prune failed: {e}')
 
 
 def process_git_patch(patch):
@@ -180,7 +441,8 @@ def process_instance(
 
     try:
         runtime = create_runtime(config)
-        call_async_from_sync(runtime.connect)
+        with _env_prepare_concurrency_slot():
+            call_async_from_sync(runtime.connect)
         # Get patch and save it to /tmp/patch.diff
         with tempfile.TemporaryDirectory() as temp_dir:
             # Patch file
@@ -356,6 +618,7 @@ def process_instance(
             )
     finally:
         runtime.close()
+        _cleanup_runtime_image(runtime, instance_id)
 
 
 if __name__ == '__main__':

@@ -28,8 +28,14 @@ export RUN_WITH_BROWSING=false
 
 # Guard against stuck relaunches
 export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
-export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-1800}
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
 export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
+export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-8}
+
+# Remove Docker images after each eval instance completes (prevents disk full).
+# Set to "false" to keep images cached for faster re-runs.
+# export EVAL_CLEANUP_IMAGES=false
+export EVAL_CLEANUP_IMAGES=${EVAL_CLEANUP_IMAGES:-true}
 
 echo "======================================"
 echo "SWE-Gym Rollout (Thin Docker)"
@@ -155,8 +161,10 @@ for run_idx in $(seq 1 $N_RUNS); do
     echo "### Evaluating run $run_idx/$N_RUNS on $OUTPUT_FILE ... ###"
 
     while true; do
+        # Ensure thin_docker runtime for eval (avoid full DockerRuntime overlay builds)
+        export RUNTIME=thin_docker
         COMMAND="poetry run python evaluation/benchmarks/swe_bench/eval_infer.py \
-        --eval-num-workers $((N_WORKERS * 2)) \
+        --eval-num-workers $((N_WORKERS)) \
         --input-file $OUTPUT_FILE \
         --dataset $DATASET \
         --split $SPLIT"

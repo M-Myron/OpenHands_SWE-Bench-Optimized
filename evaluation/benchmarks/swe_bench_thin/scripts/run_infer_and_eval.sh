@@ -9,6 +9,17 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Guard against stuck relaunches
+export OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS=${OH_RUNTIME_PREPARE_WAIT_LOG_SECONDS:-30}
+export OH_RUNTIME_PREPARE_TIMEOUT_SECONDS=${OH_RUNTIME_PREPARE_TIMEOUT_SECONDS:-0}
+export OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS=${OH_RUNTIME_PREPARE_STALE_LOCK_SECONDS:-7200}
+export OH_RUNTIME_PREPARE_MAX_CONCURRENCY=${OH_RUNTIME_PREPARE_MAX_CONCURRENCY:-8}
+
+# Remove Docker images after each eval instance completes (prevents disk full).
+# Set to "false" to keep images cached for faster re-runs.
+# export EVAL_CLEANUP_IMAGES=false
+export EVAL_CLEANUP_IMAGES=${EVAL_CLEANUP_IMAGES:-true}
+
 # ── Step 1: Run thin inference ──
 INFER_LOG=$(mktemp /tmp/thin_infer_log.XXXXXX)
 trap "rm -f $INFER_LOG" EXIT

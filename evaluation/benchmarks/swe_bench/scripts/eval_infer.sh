@@ -32,6 +32,9 @@ echo "ENVIRONMENT: $ENVIRONMENT"
 PROCESS_FILEPATH=$(realpath $PROCESS_FILEPATH)
 FILE_DIR=$(dirname $PROCESS_FILEPATH)
 FILE_NAME=$(basename $PROCESS_FILEPATH)
+# Skip instances that reach maximum retries instead of crashing the entire evaluation
+# Failed instances will be logged to maximum_retries_exceeded.jsonl
+export EVAL_SKIP_MAXIMUM_RETRIES_EXCEEDED=true
 
 echo "Evaluating $FILE_NAME @ $FILE_DIR"
 
