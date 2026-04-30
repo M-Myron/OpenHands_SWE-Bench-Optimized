@@ -195,8 +195,30 @@ class ThinDockerRuntime(Runtime):
         self.set_runtime_status(RuntimeStatus.READY)
         self._runtime_initialized = True
 
+    # Probe candidates inside the container to find a Python >= 3.6.
+    # Order matters: prefer testbed env first, then base conda, then system.
+    _PYTHON_CANDIDATES = (
+        '/opt/miniconda3/envs/testbed/bin/python',
+        '/opt/conda/envs/testbed/bin/python',
+        '/opt/miniconda3/bin/python',
+        '/opt/conda/bin/python',
+        '/usr/bin/python3',
+        '/usr/bin/python',
+        'python3',
+        'python',
+    )
+
     def _start_container(self) -> None:
-        """Start a raw SWE-bench container and inject thin_executor."""
+        """Start a raw SWE-bench container with the thin executor as PID 1.
+
+        This mirrors the original DockerRuntime: the container's main command
+        IS the action-execution server. Benefits:
+          * If the executor crashes (bad python, missing module, port in use),
+            the container exits immediately and `_wait_until_alive` detects it
+            on the next poll instead of timing out for 10 minutes.
+          * No race with `nohup &` / detached `docker exec`.
+          * No need for /workspace to pre-exist (we mkdir it in the bootstrap).
+        """
         # Allocate port
         self._host_port, self._host_port_lock = self._find_available_port_with_lock(
             EXECUTION_SERVER_PORT_RANGE
@@ -232,11 +254,53 @@ class ThinDockerRuntime(Runtime):
         # Ensure the image is available locally (pull if needed)
         self._ensure_image_available(self.base_container_image)
 
-        # Start container with sleep infinity (keep it alive)
+        # ---- Bootstrap script: probe Python, symlink hidden name, exec ----
+        # We embed thin_executor.py into a temp file inside the container at
+        # boot time via a heredoc... but heredocs are awkward across docker run.
+        # Instead, we create the container in two phases:
+        #   1. Start with a short bootstrap that just sleeps very briefly,
+        #      so we can `docker cp` thin_executor.py in, then we need to
+        #      actually run the server.
+        # The cleanest approach is: start with a bootstrap that waits for
+        # /tmp/thin_executor.py to exist, then probes Python and execs.
+        #
+        # However this still leaves the same crash-on-detach hole. Better:
+        # use a one-shot bootstrap that:
+        #   (a) waits up to 30s for /tmp/thin_executor.py to appear,
+        #   (b) finds a Python >=3.6,
+        #   (c) execs the server (replacing PID 1 of the container).
+        # If any step fails, the container exits and we see it.
+        py_candidates_sh = ' '.join(f'"{p}"' for p in self._PYTHON_CANDIDATES)
+        bootstrap = (
+            'set -e; '
+            'mkdir -p /workspace; '
+            # Wait for thin_executor.py to be copied in (max 30s)
+            'for i in $(seq 1 60); do '
+            '  [ -f /tmp/thin_executor.py ] && break; '
+            '  sleep 0.5; '
+            'done; '
+            '[ -f /tmp/thin_executor.py ] || '
+            '{ echo "[bootstrap] thin_executor.py not copied in time" >&2; exit 1; }; '
+            # Probe candidates for Python >= 3.6
+            'PY=""; '
+            f'for p in {py_candidates_sh}; do '
+            '  if "$p" -c "import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)" '
+            '       2>/dev/null; then PY="$p"; break; fi; '
+            'done; '
+            '[ -n "$PY" ] || '
+            '{ echo "[bootstrap] no Python >=3.6 found" >&2; exit 2; }; '
+            'echo "[bootstrap] Using Python: $PY" >&2; '
+            # Symlink for killall protection (preserves sys.prefix resolution)
+            'ln -sf "$PY" /tmp/.thin_exec_py; '
+            # Exec replaces PID 1 — server crash => container exits
+            f'exec /tmp/.thin_exec_py /tmp/thin_executor.py '
+            f'{self._container_port} --working-dir /workspace'
+        )
+
         try:
             self.container = self.docker_client.containers.run(
                 self.base_container_image,
-                command=['bash', '-c', 'sleep infinity'],
+                command=['bash', '-c', bootstrap],
                 entrypoint=[],
                 network_mode=network_mode,
                 ports=port_mapping,
@@ -251,59 +315,13 @@ class ThinDockerRuntime(Runtime):
             self.close()
             raise
 
-        # Copy thin_executor.py into the container
+        # Copy thin_executor.py into the container — the bootstrap is waiting
         self._copy_file_to_container(THIN_EXECUTOR_PATH, '/tmp/thin_executor.py')
-
-        # Find a working Python in the container
-        python_path = self._find_python_in_container()
-
-        # Copy the Python binary to a hidden name so that agent commands like
-        # `killall python` or `killall -9 python3` won't kill the executor.
-        # `killall` matches on /proc/PID/comm which is the binary basename.
-        hidden_python = '/tmp/.thin_exec_py'
-        exit_code, _ = self.container.exec_run(
-            ['bash', '-c', f'cp {python_path} {hidden_python} && chmod +x {hidden_python}'],
-        )
-        if exit_code != 0:
-            self.log('warning', f'[ThinDocker] Failed to copy python to {hidden_python}, using original')
-            hidden_python = python_path
-
-        # Start the thin executor server inside the container
-        exec_cmd = f'{hidden_python} /tmp/thin_executor.py {self._container_port} --working-dir /workspace'
-        self.log('info', f'[ThinDocker] Starting thin executor: {exec_cmd}')
-
-        # Use docker exec in detached mode
-        self.container.exec_run(
-            ['bash', '-c', f'nohup {exec_cmd} > /tmp/thin_executor.log 2>&1 &'],
-            detach=True,
-        )
 
         self.log(
             'info',
-            f'[ThinDocker] Container ready. Server URL: {self.action_execution_server_url}',
-        )
-
-    def _find_python_in_container(self) -> str:
-        """Find a working Python interpreter in the container."""
-        candidates = [
-            '/opt/miniconda3/envs/testbed/bin/python',
-            '/opt/conda/envs/testbed/bin/python',
-            '/opt/miniconda3/bin/python',
-            '/usr/bin/python3',
-            '/usr/bin/python',
-            'python3',
-            'python',
-        ]
-        for python_path in candidates:
-            exit_code, output = self.container.exec_run(
-                ['bash', '-c', f'{python_path} --version 2>/dev/null && echo OK'],
-            )
-            if exit_code == 0 and b'OK' in output:
-                self.log('info', f'[ThinDocker] Using Python: {python_path}')
-                return python_path
-
-        raise RuntimeError(
-            'Could not find a working Python interpreter in the container'
+            f'[ThinDocker] Container started: {self.container_name}. '
+            f'Server URL: {self.action_execution_server_url}',
         )
 
     def _ensure_image_available(self, image: str) -> None:
@@ -367,7 +385,9 @@ class ThinDockerRuntime(Runtime):
                 self._container_port = self._host_port
 
     @tenacity.retry(
-        stop=tenacity.stop_after_delay(120) | stop_if_should_exit(),
+        stop=tenacity.stop_after_delay(
+            int(os.environ.get('OH_THIN_DOCKER_ALIVE_TIMEOUT', '600'))
+        ) | stop_if_should_exit(),
         retry=tenacity.retry_if_exception(_is_retryable_error),
         reraise=True,
         wait=tenacity.wait_fixed(2),
