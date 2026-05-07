@@ -190,10 +190,10 @@ for run_idx in $(seq 1 $N_RUNS); do
     done
 
     echo "### Updating the output with evaluation results for run $run_idx... ###"
-    poetry run python evaluation/benchmarks/swe_bench/scripts/eval/update_output_with_eval.py $OUTPUT_FILE
+    yes y | poetry run python evaluation/benchmarks/swe_bench/scripts/eval/update_output_with_eval.py $OUTPUT_FILE
 
     echo "### Combining the final completions for run $run_idx... ###"
-    poetry run python evaluation/benchmarks/swe_bench/scripts/eval/combine_final_completions.py $OUTPUT_FILE
+    yes y | poetry run python evaluation/benchmarks/swe_bench/scripts/eval/combine_final_completions.py $OUTPUT_FILE
 
     echo "### DONE for run $run_idx! ###"
 done
