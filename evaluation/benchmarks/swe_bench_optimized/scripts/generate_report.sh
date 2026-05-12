@@ -13,6 +13,7 @@
 # and produces an aggregated report.json in <output_dir>/report.json.
 # It also regenerates the README.md summary.
 # ./evaluation/benchmarks/swe_bench_optimized/scripts/generate_report.sh /home/v-murongma/code/OpenHands_SWE-Bench-Optimized/evaluation/evaluation_outputs/outputs/princeton-nlp__SWE-bench_Verified-test/CodeActAgent/policy_traj_128k_swegym_all_2092i_qwen2.5_coder_32b_full_128k_megatron_20260416_113234_maxiter_100_N_v0.61.0-no-hint "princeton-nlp/SWE-bench_Verified" "test"
+# ./evaluation/benchmarks/swe_bench_optimized/scripts/generate_report.sh /home/v-murongma/code/OpenHands_SWE-Bench-Optimized/evaluation/evaluation_outputs/outputs_thin/princeton-nlp__SWE-bench_Lite-test/CodeActAgent/policy_traj_128k_swegym_resolved_752i_qwen2.5_coder_32b_full_128k_megatron_20260428_155440_maxiter_100_N_v0.61.0-thin-no-hint "princeton-nlp/SWE-bench_Lite" "test"
 
 
 set -euo pipefail

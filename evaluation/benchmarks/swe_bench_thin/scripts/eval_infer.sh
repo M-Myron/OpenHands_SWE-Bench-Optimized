@@ -56,7 +56,7 @@ echo "WORKERS:  $N_PROCESS"
 echo "RUNTIME:  thin_docker"
 echo "=============================================================="
 
-EVAL_CMD="poetry run python evaluation/benchmarks/swe_bench/eval_infer.py \
+EVAL_CMD="poetry run python evaluation/benchmarks/swe_bench_thin/eval_infer.py \
     --eval-num-workers $N_PROCESS \
     --input-file $PROCESS_FILEPATH \
     --dataset $DATASET_NAME \

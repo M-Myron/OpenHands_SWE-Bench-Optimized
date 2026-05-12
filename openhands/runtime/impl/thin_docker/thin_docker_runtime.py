@@ -329,7 +329,11 @@ class ThinDockerRuntime(Runtime):
 
         The Docker SDK's containers.run() auto-pull can fail silently under
         rate limits or network issues, then report a confusing 404 on inspect.
-        This method does an explicit pull with retries when the image is missing.
+        This method does an explicit pull with retries when the image is
+        missing, distinguishes transient failures (rate limit, network, EOF,
+        TLS, daemon flakiness) from a real "image does not exist", and falls
+        back to the `docker pull` CLI which surfaces registry errors more
+        reliably than the Python SDK.
         """
         try:
             self.docker_client.images.get(image)
@@ -338,25 +342,140 @@ class ThinDockerRuntime(Runtime):
         except docker.errors.ImageNotFound:
             pass
 
-        self.log('info', f'[ThinDocker] Pulling image: {image}')
-        max_retries = 3
-        last_err = None
-        for attempt in range(1, max_retries + 1):
+        platform = self.config.sandbox.platform or 'linux/amd64'
+        self.log('info', f'[ThinDocker] Pulling image: {image} (platform={platform})')
+
+        max_retries = int(os.environ.get('OH_THIN_DOCKER_PULL_RETRIES', '5'))
+        last_err: Exception | None = None
+
+        # Patterns that indicate the image truly does not exist in the registry.
+        # Anything else (rate limits, EOF, TLS, timeouts, network resets, the
+        # SDK's post-pull inspect-404, daemon "no such image" right after pull)
+        # is treated as transient and retried.
+        definitive_not_found_patterns = (
+            'manifest unknown',
+            'manifest for ',  # "manifest for X not found"
+            'repository does not exist',
+            'name unknown',
+            'pull access denied',
+            'requested access to the resource is denied',
+            'unauthorized: authentication required',  # often transient too, but treat as fatal-ish
+        )
+        transient_patterns = (
+            'toomanyrequests',
+            'rate limit',
+            'timeout',
+            'temporary failure',
+            'connection reset',
+            'connection refused',
+            'eof',
+            'tls handshake',
+            'i/o timeout',
+            'no such host',
+            'server misbehaving',
+            'no such image',  # post-pull inspect race
+            '500 server error',
+            '502 ',
+            '503 ',
+            '504 ',
+        )
+
+        def _classify(err: Exception) -> str:
+            msg = str(err).lower()
+            for p in definitive_not_found_patterns:
+                if p in msg:
+                    return 'not_found'
+            for p in transient_patterns:
+                if p in msg:
+                    return 'transient'
+            # Unknown — be conservative and retry.
+            return 'transient'
+
+        def _verify_local() -> bool:
             try:
-                self.docker_client.images.pull(image, platform=self.config.sandbox.platform or 'linux/amd64')
+                self.docker_client.images.get(image)
+                return True
+            except docker.errors.ImageNotFound:
+                return False
+            except Exception:
+                return False
+
+        def _cli_pull() -> tuple[bool, str]:
+            try:
+                proc = subprocess.run(
+                    ['docker', 'pull', '--platform', platform, image],
+                    capture_output=True,
+                    text=True,
+                    timeout=int(os.environ.get('OH_THIN_DOCKER_PULL_TIMEOUT', '600')),
+                )
+                output = (proc.stdout or '') + (proc.stderr or '')
+                return proc.returncode == 0, output.strip()
+            except Exception as e:
+                return False, f'docker pull CLI invocation failed: {e}'
+
+        for attempt in range(1, max_retries + 1):
+            # Try SDK pull first.
+            sdk_err: Exception | None = None
+            try:
+                self.docker_client.images.pull(image, platform=platform)
+            except Exception as e:
+                sdk_err = e
+
+            if _verify_local():
                 self.log('info', f'[ThinDocker] Successfully pulled image: {image}')
                 return
-            except Exception as e:
-                last_err = e
+
+            # SDK pull either raised or "succeeded" without leaving an image.
+            # Fall back to the docker CLI which reports registry errors faithfully.
+            if sdk_err is not None:
                 self.log(
                     'warning',
-                    f'[ThinDocker] Pull attempt {attempt}/{max_retries} failed for {image}: {e}',
+                    f'[ThinDocker] SDK pull attempt {attempt}/{max_retries} failed for {image}: {sdk_err}. '
+                    f'Falling back to `docker pull` CLI.',
                 )
-                if attempt < max_retries:
-                    time.sleep(5 * attempt)
+            else:
+                self.log(
+                    'warning',
+                    f'[ThinDocker] SDK pull attempt {attempt}/{max_retries} for {image} reported success '
+                    f'but image is not present locally. Falling back to `docker pull` CLI.',
+                )
+
+            cli_ok, cli_output = _cli_pull()
+            if cli_ok and _verify_local():
+                self.log('info', f'[ThinDocker] Successfully pulled image via CLI: {image}')
+                return
+
+            cli_err = RuntimeError(cli_output or 'docker pull CLI failed with no output')
+            last_err = cli_err if not cli_ok else (sdk_err or cli_err)
+
+            # Definitive 404 from the CLI? Stop retrying immediately.
+            if not cli_ok and _classify(cli_err) == 'not_found':
+                self.log(
+                    'error',
+                    f'[ThinDocker] Image {image} does not exist in registry: {cli_output}',
+                )
+                raise docker.errors.ImageNotFound(
+                    f'Image {image} does not exist in registry: {cli_output}'
+                )
+
+            self.log(
+                'warning',
+                f'[ThinDocker] Pull attempt {attempt}/{max_retries} failed for {image} '
+                f'(transient): {cli_output or sdk_err}',
+            )
+            if attempt < max_retries:
+                # Exponential backoff with cap. All env-tunable:
+                #   OH_THIN_DOCKER_PULL_BACKOFF_BASE       initial wait (s, default 5)
+                #   OH_THIN_DOCKER_PULL_BACKOFF_MULTIPLIER growth factor (default 2)
+                #   OH_THIN_DOCKER_PULL_BACKOFF_MAX        cap per sleep (s, default 60)
+                base = float(os.environ.get('OH_THIN_DOCKER_PULL_BACKOFF_BASE', '5'))
+                mult = float(os.environ.get('OH_THIN_DOCKER_PULL_BACKOFF_MULTIPLIER', '2'))
+                cap = float(os.environ.get('OH_THIN_DOCKER_PULL_BACKOFF_MAX', '60'))
+                backoff = min(base * (mult ** (attempt - 1)), cap)
+                time.sleep(backoff)
 
         raise docker.errors.ImageNotFound(
-            f'Failed to pull image {image} after {max_retries} attempts: {last_err}'
+            f'Failed to pull image {image} after {max_retries} attempts (last error: {last_err})'
         )
 
     def _copy_file_to_container(self, host_path: str, container_path: str) -> None:
